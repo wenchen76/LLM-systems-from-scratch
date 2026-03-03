@@ -6,7 +6,7 @@ from typing import Callable, Iterable
 import torch
 
 
-def get_cosine_lr(
+def cosine_lr_schedule(
     step: int,
     max_learning_rate: float,
     min_learning_rate: float,
