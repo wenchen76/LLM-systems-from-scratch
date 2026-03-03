@@ -1,0 +1,34 @@
+[project]
+name = "llm-core"
+version = "0.1.0"
+description = "LLM components built from scratch"
+requires-python = ">=3.11"
+dependencies = [
+    "einops>=0.8.1",
+    "jaxtyping>=0.3.0",
+    "numpy",
+    "torch~=2.6.0; sys_platform != 'darwin' or platform_machine != 'x86_64'",
+    "torch~=2.2.2; sys_platform == 'darwin' and platform_machine == 'x86_64'",
+]
+
+[tool.setuptools.packages.find]
+include = ["llm_core"]
+
+[tool.uv]
+package = true
+python-preference = "managed"
+
+[tool.pytest.ini_options]
+log_cli = true
+log_cli_level = "WARNING"
+addopts = "-s"
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+extend-select = ["UP"]
+ignore = ["F722"]
+
+[tool.ruff.lint.extend-per-file-ignores]
+"__init__.py" = ["E402", "F401", "F403", "E501"]
