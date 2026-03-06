@@ -10,9 +10,9 @@ model:
 training:
   device: "auto"
   batch_size: 64
-  max_iters: 5000
-  val_every: 500
-  gpu_log_every: 100
+  max_steps: 5000
+  val_interval: 500
+  gpu_log_interval: 100
   checkpoint_dir: "checkpoints/sample"
   wandb: true
   wandb_project: "sample"
@@ -23,7 +23,7 @@ optimizer:
   weight_decay: 0.1
   max_grad_norm: 1.0
   warmup_steps: 200
-  cosine_cycle_steps: 5000
+  decay_steps: 5000
 
 dataset:
   train_path: "data/train.bin"

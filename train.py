@@ -70,7 +70,7 @@ def load_config(path: str) -> dict:
         return yaml.safe_load(f)
 
 
-def train(config_path: str = "./configures/sample.yaml"):
+def train(config_path: str = "./configures/sample.yaml", use_amp: bool = False):
     config = load_config(config_path)
     model_cfg = config["model"]
     train_cfg = config["training"]
@@ -79,9 +79,9 @@ def train(config_path: str = "./configures/sample.yaml"):
 
     use_wandb = train_cfg["wandb"]
     batch_size = train_cfg["batch_size"]
-    max_iters = train_cfg["max_iters"]
-    val_every = train_cfg["val_every"]
-    gpu_log_every = train_cfg["gpu_log_every"]
+    max_steps = train_cfg["max_steps"]
+    val_interval = train_cfg["val_interval"]
+    gpu_log_interval = train_cfg["gpu_log_interval"]
     checkpoint_dir = train_cfg["checkpoint_dir"]
 
     context_length = model_cfg["context_length"]
@@ -91,6 +91,7 @@ def train(config_path: str = "./configures/sample.yaml"):
     max_grad_norm = optim_cfg["max_grad_norm"]
 
     device = detect_device() if train_cfg["device"] == "auto" else train_cfg["device"]
+    amp_device_type = device.split(":")[0]
 
     if use_wandb:
         run_name = f"bs{batch_size}_lr{lr_max}_layer{model_cfg['num_layers']}"
@@ -102,7 +103,7 @@ def train(config_path: str = "./configures/sample.yaml"):
                 "learning_rate": lr_max,
                 "context_length": context_length,
                 "d_model": model_cfg["d_model"],
-                "max_iters": max_iters,
+                "max_steps": max_steps,
             },
         )
 
@@ -128,7 +129,7 @@ def train(config_path: str = "./configures/sample.yaml"):
         weight_decay=float(optim_cfg["weight_decay"]),
     )
 
-    for step in range(max_iters):
+    for step in range(max_steps):
         if device == "cuda":
             torch.cuda.synchronize()
         step_start = time.time()
@@ -138,7 +139,7 @@ def train(config_path: str = "./configures/sample.yaml"):
             max_learning_rate=lr_max,
             min_learning_rate=lr_min,
             warmup_steps=optim_cfg["warmup_steps"],
-            cosine_cycle_steps=optim_cfg["cosine_cycle_steps"],
+            decay_steps=optim_cfg["decay_steps"],
         )
         for group in optimizer.param_groups:
             group["lr"] = lr
@@ -151,8 +152,9 @@ def train(config_path: str = "./configures/sample.yaml"):
         )
 
         optimizer.zero_grad()
-        logits = model(x)
-        loss = cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
+        with torch.autocast(device_type=amp_device_type, dtype=torch.bfloat16, enabled=use_amp):
+            logits = model(x)
+            loss = cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
         loss.backward()
         clip_gradient(model.parameters(), max_grad_norm)
         optimizer.step()
@@ -167,7 +169,7 @@ def train(config_path: str = "./configures/sample.yaml"):
         if use_wandb:
             wandb.log({"train/loss": loss.item(), "train/lr": lr, "step": step})
 
-        if step % val_every == 0 and step > 0:
+        if step % val_interval == 0 and step > 0:
             model.eval()
             with torch.no_grad():
                 x_val, y_val = sample_batch(
@@ -184,7 +186,7 @@ def train(config_path: str = "./configures/sample.yaml"):
                 print(f"[Validation] Step {step}: val_loss = {val_loss.item():.4f}")
             model.train()
 
-        if step % val_every == 0 and step > 0:
+        if step % val_interval == 0 and step > 0:
             save_checkpoint(
                 model=model,
                 optimizer=optimizer,
@@ -192,7 +194,7 @@ def train(config_path: str = "./configures/sample.yaml"):
                 path=os.path.join(checkpoint_dir, f"ckpt_{step}.pt"),
             )
 
-        if use_wandb and step % gpu_log_every == 0:
+        if use_wandb and step % gpu_log_interval == 0:
             allocated_memory = int(torch.cuda.memory_allocated() / 1024**2)
             cached_memory = int(torch.cuda.memory_reserved() / 1024**2)
             wandb.log({"allocated_memory": allocated_memory, "cached_memory": cached_memory})
@@ -208,7 +210,7 @@ def train(config_path: str = "./configures/sample.yaml"):
     save_checkpoint(
         model=model,
         optimizer=optimizer,
-        iteration=max_iters,
+        iteration=max_steps,
         path=os.path.join(checkpoint_dir, "ckpt_final.pt"),
     )
 
@@ -216,8 +218,9 @@ def train(config_path: str = "./configures/sample.yaml"):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="./configures/sample.yaml", help="Path to training config YAML")
+    parser.add_argument("--amp", action="store_true", help="Enable mixed-precision training with BF16")
     args = parser.parse_args()
-    train(config_path=args.config)
+    train(config_path=args.config, use_amp=args.amp)
 
 
 if __name__ == "__main__":

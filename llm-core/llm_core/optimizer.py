@@ -11,13 +11,13 @@ def cosine_lr_schedule(
     max_learning_rate: float,
     min_learning_rate: float,
     warmup_steps: int,
-    cosine_cycle_steps: int,
+    decay_steps: int,
 ) -> float:
     if step < warmup_steps:
         return max_learning_rate * step / warmup_steps
-    if step > cosine_cycle_steps:
+    if step > decay_steps:
         return min_learning_rate
-    decay_ratio = (step - warmup_steps) / (cosine_cycle_steps - warmup_steps)
+    decay_ratio = (step - warmup_steps) / (decay_steps - warmup_steps)
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return min_learning_rate + coeff * (max_learning_rate - min_learning_rate)
 
