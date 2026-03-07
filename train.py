@@ -71,6 +71,7 @@ def load_config(path: str) -> dict:
 
 
 def train(config_path: str = "./configures/sample.yaml", use_amp: bool = False, use_compile: bool = False, use_flash_attn: bool = False):
+    torch.set_float32_matmul_precision("high")
     config = load_config(config_path)
     model_cfg = config["model"]
     train_cfg = config["training"]
