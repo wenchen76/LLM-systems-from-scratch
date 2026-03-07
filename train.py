@@ -70,7 +70,7 @@ def load_config(path: str) -> dict:
         return yaml.safe_load(f)
 
 
-def train(config_path: str = "./configures/sample.yaml", use_amp: bool = False, use_compile: bool = False):
+def train(config_path: str = "./configures/sample.yaml", use_amp: bool = False, use_compile: bool = False, use_flash_attn: bool = False):
     config = load_config(config_path)
     model_cfg = config["model"]
     train_cfg = config["training"]
@@ -120,6 +120,7 @@ def train(config_path: str = "./configures/sample.yaml", use_amp: bool = False, 
         context_length=context_length,
         num_layers=model_cfg["num_layers"],
         rope_theta=model_cfg["rope_theta"],
+        use_flash_attn=use_flash_attn,
     ).to(device)
 
     if use_compile:
@@ -223,8 +224,9 @@ def main():
     parser.add_argument("--config", type=str, default="./configures/sample.yaml", help="Path to training config YAML")
     parser.add_argument("--amp", action="store_true", help="Enable mixed-precision training with BF16")
     parser.add_argument("--compile", action="store_true", help="Enable torch.compile for faster training")
+    parser.add_argument("--flash-attn", action="store_true", help="Use PyTorch's scaled_dot_product_attention (FlashAttention2)")
     args = parser.parse_args()
-    train(config_path=args.config, use_amp=args.amp, use_compile=args.compile)
+    train(config_path=args.config, use_amp=args.amp, use_compile=args.compile, use_flash_attn=args.flash_attn)
 
 
 if __name__ == "__main__":

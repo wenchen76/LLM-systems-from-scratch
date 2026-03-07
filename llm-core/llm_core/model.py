@@ -132,6 +132,7 @@ class TransformerLM(nn.Module):
         num_heads: int,
         d_ff: int,
         rope_theta: float,
+        use_flash_attn: bool = False,
     ):
         # Capture config for serialization
         self.config = {
@@ -154,6 +155,7 @@ class TransformerLM(nn.Module):
                 num_heads=num_heads,
                 d_ff=d_ff,
                 positional_encoder=self.positional_encoder,
+                use_flash_attn=use_flash_attn,
             )
             for _ in range(num_layers)
         ])
@@ -257,12 +259,14 @@ class TransformerBlock(nn.Module):
         num_heads: int,
         d_ff: int,
         positional_encoder: RotaryEmbedding,
+        use_flash_attn: bool = False,
     ):
         super().__init__()
         self.attn = CausalMultiHeadSelfAttention(
             d_model=d_model,
             num_heads=num_heads,
             positional_encoder=positional_encoder,
+            use_flash_attn=use_flash_attn,
         )
         self.ffn = SwiGLU(d_model=d_model, d_ff=d_ff)
         self.attn_norm = RMSNorm(d_model)
@@ -315,11 +319,13 @@ class CausalMultiHeadSelfAttention(nn.Module):
         d_model: int,
         num_heads: int,
         positional_encoder: RotaryEmbedding,
+        use_flash_attn: bool = False,
     ):
         super().__init__()
         assert d_model % num_heads == 0
         self.d_model = d_model
         self.num_heads = num_heads
+        self.use_flash_attn = use_flash_attn
 
         self.d_head = d_model // num_heads
 
@@ -358,8 +364,11 @@ class CausalMultiHeadSelfAttention(nn.Module):
         K = self.positional_encoder(K, token_positions)
 
         # Attention
-        causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool))
-        attn_output = scaled_dot_product_attention(Q, K, V, causal_mask)
+        if self.use_flash_attn:
+            attn_output = torch.nn.functional.scaled_dot_product_attention(Q, K, V, is_causal=True)
+        else:
+            causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool))
+            attn_output = scaled_dot_product_attention(Q, K, V, causal_mask)
 
         # Merge heads: (..., num_heads, seq, d_head) -> (..., seq, num_heads * d_head)
         attn_output = rearrange(attn_output, "... heads seq d_head -> ... seq (heads d_head)").contiguous()
