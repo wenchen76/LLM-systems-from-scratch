@@ -1,7 +1,7 @@
 import argparse
 import torch
 from llm_core.model import TransformerLM
-from Tokenizer.BPETokenizer import Tokenizer
+from tokenizer.BPETokenizer import Tokenizer
 
 
 def main():
