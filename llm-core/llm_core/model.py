@@ -133,6 +133,7 @@ class TransformerLM(nn.Module):
         d_ff: int,
         rope_theta: float,
         use_flash_attn: bool = False,
+        use_custom_triton: bool = False,
     ):
         # Capture config for serialization
         self.config = {
@@ -156,6 +157,7 @@ class TransformerLM(nn.Module):
                 d_ff=d_ff,
                 positional_encoder=self.positional_encoder,
                 use_flash_attn=use_flash_attn,
+                use_custom_triton=use_custom_triton,
             )
             for _ in range(num_layers)
         ])
@@ -260,6 +262,7 @@ class TransformerBlock(nn.Module):
         d_ff: int,
         positional_encoder: RotaryEmbedding,
         use_flash_attn: bool = False,
+        use_custom_triton: bool = False,
     ):
         super().__init__()
         self.attn = CausalMultiHeadSelfAttention(
@@ -268,7 +271,11 @@ class TransformerBlock(nn.Module):
             positional_encoder=positional_encoder,
             use_flash_attn=use_flash_attn,
         )
-        self.ffn = SwiGLU(d_model=d_model, d_ff=d_ff)
+        if use_custom_triton:
+            from llm_systems.kernels.triton_swiglu import FusedSwiGLU
+            self.ffn = FusedSwiGLU(d_model=d_model, d_ff=d_ff)
+        else:
+            self.ffn = SwiGLU(d_model=d_model, d_ff=d_ff)
         self.attn_norm = RMSNorm(d_model)
         self.ffn_norm = RMSNorm(d_model)
 
