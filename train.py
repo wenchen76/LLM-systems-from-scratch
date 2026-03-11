@@ -135,7 +135,13 @@ def train(
         model = torch.compile(model)
 
     model.train()
-    optimizer = AdamW(
+    if use_custom_triton:
+        from llm_systems.kernels.triton_adamw import FusedAdamW
+        OptimizerClass = FusedAdamW
+        print("Using custom Triton FusedAdamW")
+    else:
+        OptimizerClass = AdamW
+    optimizer = OptimizerClass(
         params=model.parameters(),
         lr=lr_max,
         weight_decay=float(optim_cfg["weight_decay"]),
@@ -233,7 +239,7 @@ def main():
     parser.add_argument("--amp", action="store_true", help="Enable mixed-precision training with BF16")
     parser.add_argument("--compile", action="store_true", help="Enable torch.compile for faster training")
     parser.add_argument("--flash-attn", action="store_true", help="Use PyTorch's scaled_dot_product_attention (FlashAttention2)")
-    parser.add_argument("--custom-triton", action="store_true", help="Use custom Triton FusedSwiGLU kernel in place of SwiGLU")
+    parser.add_argument("--custom-triton", action="store_true", help="Use custom Triton kernels in place of the Pytorch implementations")
     args = parser.parse_args()
     train(
         config_path=args.config,
