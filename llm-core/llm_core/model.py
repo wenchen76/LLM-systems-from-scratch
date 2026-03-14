@@ -161,7 +161,11 @@ class TransformerLM(nn.Module):
             )
             for _ in range(num_layers)
         ])
-        self.final_norm = RMSNorm(d_model)
+        if use_custom_triton:
+            from llm_systems.kernels.triton_rms_norm import TritonRMSNorm
+            self.final_norm = TritonRMSNorm(d_model)
+        else:
+            self.final_norm = RMSNorm(d_model)
         self.lm_head = Linear(d_model, vocab_size)
 
         logger.info(f"non-embedding parameters: {self.get_num_params() / 1e6:.2f}M")
@@ -272,12 +276,15 @@ class TransformerBlock(nn.Module):
             use_flash_attn=use_flash_attn,
         )
         if use_custom_triton:
+            from llm_systems.kernels.triton_rms_norm import TritonRMSNorm
             from llm_systems.kernels.triton_swiglu import FusedSwiGLU
             self.ffn = FusedSwiGLU(d_model=d_model, d_ff=d_ff)
+            self.attn_norm = TritonRMSNorm(d_model)
+            self.ffn_norm = TritonRMSNorm(d_model)
         else:
             self.ffn = SwiGLU(d_model=d_model, d_ff=d_ff)
-        self.attn_norm = RMSNorm(d_model)
-        self.ffn_norm = RMSNorm(d_model)
+            self.attn_norm = RMSNorm(d_model)
+            self.ffn_norm = RMSNorm(d_model)
 
     def forward(self, x: Float[Tensor, " ... seq d_model"]) -> Float[Tensor, " ... seq d_model"]:
         x = x + self.attn(self.attn_norm(x))
