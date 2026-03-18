@@ -137,10 +137,12 @@ def train(
     model.train()
     if use_custom_triton:
         from llm_systems.kernels.triton_adamw import FusedAdamW
+        from llm_systems.kernels.triton_cross_entropy import triton_cross_entropy
         OptimizerClass = FusedAdamW
-        print("Using custom Triton FusedAdamW")
+        cross_entropy_fn = triton_cross_entropy
     else:
         OptimizerClass = AdamW
+        cross_entropy_fn = cross_entropy
     optimizer = OptimizerClass(
         params=model.parameters(),
         lr=lr_max,
@@ -172,7 +174,7 @@ def train(
         optimizer.zero_grad()
         with torch.autocast(device_type=amp_device_type, dtype=torch.bfloat16, enabled=use_amp):
             logits = model(x)
-            loss = cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
+            loss = cross_entropy_fn(logits.view(-1, logits.size(-1)), y.view(-1))
         loss.backward()
         clip_gradient(model.parameters(), max_grad_norm)
         optimizer.step()
@@ -197,7 +199,7 @@ def train(
                     device=device,
                 )
                 val_logits = model(x_val)
-                val_loss = cross_entropy(val_logits[:, -1, :], y_val[:, -1])
+                val_loss = cross_entropy_fn(val_logits[:, -1, :], y_val[:, -1])
 
                 if use_wandb:
                     wandb.log({"val/loss": val_loss.item(), "step": step})
