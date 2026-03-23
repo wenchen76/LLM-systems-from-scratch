@@ -16,17 +16,17 @@ Key features:
 Autograd graph and backward ordering:
 
   Forward graph:
-    embedding → Hook_0 → layer_0 → Hook_1 → layer_1 → ... → Hook_N → layer_N → EndHook → ln_final → lm_head
+    embedding → Hook_0 → layer_0 → Hook_1 → layer_1 → ... → Hook_N → layer_N → EndHook → final_norm → lm_head
 
   Backward order (reverse of forward):
-    lm_head.bw → ln_final.bw → EndHook.bw → layer_N.bw → Hook_N.bw → ... → layer_1.bw → Hook_1.bw → layer_0.bw → Hook_0.bw → embedding.bw
+    lm_head.bw → final_norm.bw → EndHook.bw → layer_N.bw → Hook_N.bw → ... → layer_1.bw → Hook_1.bw → layer_0.bw → Hook_0.bw → embedding.bw
 
   - EndHook.backward(): Re-gathers layer_N params (for upcoming layer_N.bw),
     pre-fetches layer_{N-1} params
   - Hook_i.backward() (runs AFTER layer_i.bw): Reduce-scatters layer_i grads,
     re-gathers layer_{i-1} params, pre-fetches layer_{i-2} params
   - Hook_0.backward() (runs AFTER layer_0.bw): Reduce-scatters layer_0 grads
-  - Remaining params (embedding/ln_final/lm_head): reduce-scattered in
+  - Remaining params (embedding/final_norm/lm_head): reduce-scattered in
     finish_gradient_synchronization() after loss.backward() completes, since
     embedding is the first forward op and no differentiable hook can precede it
 """
@@ -276,7 +276,7 @@ class FSDP(torch.nn.Module):
                 self.unit_modules.append(layer)
 
         # Wrap remaining (non-layer) parameters as a single unit
-        # This includes: token_embeddings, positional_encoder, ln_final, lm_head
+        # This includes: token_embeddings, positional_encoder, final_norm, lm_head
         remaining = _RemainingParams(module)
         if list(remaining.parameters()):
             unit = FSDPUnit(remaining, self.rank, self.world_size,
@@ -303,15 +303,15 @@ class FSDP(torch.nn.Module):
         """Forward pass with eager pre-fetching of next layer's params.
 
         Builds the autograd graph as:
-          embedding → Hook_0 → layer_0 → ... → Hook_N → layer_N → EndHook → ln_final → lm_head
+          embedding → Hook_0 → layer_0 → ... → Hook_N → layer_N → EndHook → final_norm → lm_head
 
         So backward runs as:
-          lm_head.bw → ln_final.bw → EndHook.bw → layer_N.bw → Hook_N.bw → ... → layer_0.bw → Hook_0.bw → embedding.bw
+          lm_head.bw → final_norm.bw → EndHook.bw → layer_N.bw → Hook_N.bw → ... → layer_0.bw → Hook_0.bw → embedding.bw
 
         - EndHook.bw: re-gathers layer_N params, pre-fetches layer_{N-1}
         - Hook_i.bw (after layer_i.bw): reduce-scatters layer_i grads,
           re-gathers layer_{i-1} params, pre-fetches layer_{i-2}
-        - Remaining params (embedding/ln_final/lm_head) are reduce-scattered
+        - Remaining params (embedding/final_norm/lm_head) are reduce-scattered
           in finish_gradient_synchronization() after backward completes
         """
         remaining_unit = self.fsdp_units[-1] if len(self.fsdp_units) > len(self.module.layers) else None
@@ -374,7 +374,7 @@ class FSDP(torch.nn.Module):
             )
 
         # --- Final norm + lm_head ---
-        x = self.module.ln_final(x)
+        x = self.module.final_norm(x)
         output = self.module.lm_head(x)
 
         # Inference: discard remaining unit
@@ -386,13 +386,13 @@ class FSDP(torch.nn.Module):
     def finish_gradient_synchronization(self):
         """Wait for all pending reduce-scatter operations to complete.
 
-        Also handles reduce-scatter for the remaining unit (embedding/ln_final/lm_head).
+        Also handles reduce-scatter for the remaining unit (embedding/final_norm/lm_head).
         We do this here rather than in an autograd hook because embedding is the
         first operation in forward (so last in backward), and we can't place a
         differentiable hook before it — inputs[0] is integer token IDs with no
         gradient flow. By the time loss.backward() returns, all grads are computed.
         """
-        # Reduce-scatter remaining unit grads (embedding/ln_final/lm_head)
+        # Reduce-scatter remaining unit grads (embedding/final_norm/lm_head)
         remaining_unit = self.fsdp_units[-1] if len(self.fsdp_units) > len(self.module.layers) else None
         if remaining_unit is not None:
             remaining_unit.reduce_scatter_grads(self.comm_stream, async_op=True)
