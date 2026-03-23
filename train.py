@@ -9,6 +9,8 @@ import typing
 
 import numpy as np
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 import wandb
 import yaml
 
@@ -70,7 +72,10 @@ def load_config(path: str) -> dict:
         return yaml.safe_load(f)
 
 
-def train(
+def train_worker(
+    rank: int = 0,
+    world_size: int = 1,
+    use_fsdp: bool = False,
     config_path: str = "./configures/sample.yaml",
     use_amp: bool = False,
     use_compile: bool = False,
@@ -97,11 +102,24 @@ def train(
     lr_min = float(optim_cfg["learning_rate_min"])
     max_grad_norm = optim_cfg["max_grad_norm"]
 
-    device = detect_device() if train_cfg["device"] == "auto" else train_cfg["device"]
+    if use_fsdp:
+        os.environ.setdefault("MASTER_ADDR", "localhost")
+        os.environ.setdefault("MASTER_PORT", "29500")
+        dist.init_process_group("nccl", rank=rank, world_size=world_size)
+        local_rank = rank % torch.cuda.device_count()
+        torch.cuda.set_device(local_rank)
+        device = f"cuda:{local_rank}"
+        # Only rank 0 logs to wandb
+        if rank != 0:
+            use_wandb = False
+    else:
+        device = detect_device() if train_cfg["device"] == "auto" else train_cfg["device"]
     amp_device_type = device.split(":")[0]
 
     if use_wandb:
         run_name = f"bs{batch_size}_lr{lr_max}_layer{model_cfg['num_layers']}"
+        if use_fsdp:
+            run_name += f"_fsdp_ws{world_size}"
         wandb.init(
             project=train_cfg["wandb_project"],
             name=run_name,
@@ -111,10 +129,12 @@ def train(
                 "context_length": context_length,
                 "d_model": model_cfg["d_model"],
                 "max_steps": max_steps,
+                "use_fsdp": use_fsdp,
+                "world_size": world_size,
             },
         )
 
-    print(f"Device: {device}")
+    print(f"[Rank {rank}] device: {device}")
 
     train_data = np.memmap(dataset_cfg["train_path"], dtype=np.uint32, mode="r")
     val_data = np.memmap(dataset_cfg["val_path"], dtype=np.uint32, mode="r")
@@ -131,8 +151,14 @@ def train(
         use_custom_triton=use_custom_triton,
     ).to(device)
 
+    inner_model = model  # keep reference to the unwrapped TransformerLM for checkpointing
+
     if use_compile:
         model = torch.compile(model)
+
+    if use_fsdp:
+        from llm_systems.parallelism.fsdp_zero3 import FSDP
+        model = FSDP(model)
 
     model.train()
     if use_custom_triton:
@@ -148,6 +174,9 @@ def train(
         lr=lr_max,
         weight_decay=float(optim_cfg["weight_decay"]),
     )
+
+    # Under FSDP each rank processes a slice of the global batch.
+    local_batch_size = batch_size // world_size if use_fsdp else batch_size
 
     for step in range(max_steps):
         if device == "cuda":
@@ -166,16 +195,21 @@ def train(
 
         x, y = sample_batch(
             tokens=train_data,
-            batch_size=batch_size,
+            batch_size=local_batch_size,
             context_length=context_length,
             device=device,
         )
 
-        optimizer.zero_grad()
+        # Use model.zero_grad() (not optimizer.zero_grad()) so FSDP's custom
+        # zero_grad also releases the unsharded grad references held on each
+        # unit.module's parameters — otherwise those stale tensors leak memory.
+        model.zero_grad()
         with torch.autocast(device_type=amp_device_type, dtype=torch.bfloat16, enabled=use_amp):
             logits = model(x)
             loss = cross_entropy_fn(logits.view(-1, logits.size(-1)), y.view(-1))
         loss.backward()
+        if use_fsdp:
+            model.finish_gradient_synchronization()
         clip_gradient(model.parameters(), max_grad_norm)
         optimizer.step()
 
@@ -184,7 +218,7 @@ def train(
         step_time = time.time() - step_start
         tokens_per_step = batch_size * context_length
         tokens_per_sec = tokens_per_step / step_time
-        print(f"Step {step}: loss = {loss.item():.4f}, lr = {lr:.6f}, time = {step_time:.4f}s, tok/s = {tokens_per_sec:.0f}")
+        print(f"[Rank {rank}] Step {step}: loss = {loss.item():.4f}, lr = {lr:.6f}, time = {step_time:.4f}s, tok/s = {tokens_per_sec:.0f}")
 
         if use_wandb:
             wandb.log({"train/loss": loss.item(), "train/lr": lr, "step": step})
@@ -194,7 +228,7 @@ def train(
             with torch.no_grad():
                 x_val, y_val = sample_batch(
                     tokens=val_data,
-                    batch_size=batch_size,
+                    batch_size=local_batch_size,
                     context_length=context_length,
                     device=device,
                 )
@@ -203,12 +237,12 @@ def train(
 
                 if use_wandb:
                     wandb.log({"val/loss": val_loss.item(), "step": step})
-                print(f"[Validation] Step {step}: val_loss = {val_loss.item():.4f}")
+                print(f"[Rank {rank}] [Validation] Step {step}: val_loss = {val_loss.item():.4f}")
             model.train()
 
-        if step % val_interval == 0 and step > 0:
+        if step % val_interval == 0 and step > 0 and not use_fsdp:
             save_checkpoint(
-                model=model,
+                model=inner_model,
                 optimizer=optimizer,
                 iteration=step,
                 path=os.path.join(checkpoint_dir, f"ckpt_{step}.pt"),
@@ -227,12 +261,28 @@ def train(
                     f"gpu_{idx}_temperature": temperature,
                 })
 
-    save_checkpoint(
-        model=model,
-        optimizer=optimizer,
-        iteration=max_steps,
-        path=os.path.join(checkpoint_dir, "ckpt_final.pt"),
-    )
+    if use_fsdp:
+        # Gather full params onto every rank so rank 0 can write a complete state dict.
+        for unit in model.fsdp_units:
+            unit.all_gather_params(async_op=False)
+        if rank == 0:
+            save_checkpoint(
+                model=inner_model,
+                optimizer=optimizer,
+                iteration=max_steps,
+                path=os.path.join(checkpoint_dir, "ckpt_final.pt"),
+                save_optimizer=False,
+            )
+        for unit in model.fsdp_units:
+            unit.discard_full_params()
+        dist.destroy_process_group()
+    else:
+        save_checkpoint(
+            model=inner_model,
+            optimizer=optimizer,
+            iteration=max_steps,
+            path=os.path.join(checkpoint_dir, "ckpt_final.pt"),
+        )
 
 
 def main():
@@ -242,14 +292,29 @@ def main():
     parser.add_argument("--compile", action="store_true", help="Enable torch.compile for faster training")
     parser.add_argument("--flash-attn", action="store_true", help="Use PyTorch's scaled_dot_product_attention (FlashAttention2)")
     parser.add_argument("--custom-triton", action="store_true", help="Use custom Triton kernels in place of the Pytorch implementations")
+    parser.add_argument("--fsdp", action="store_true", help="Enable FSDP ZeRO-3 distributed training")
+    parser.add_argument("--world-size", type=int, default=2, help="Number of GPUs for FSDP (default: 2)")
     args = parser.parse_args()
-    train(
-        config_path=args.config,
-        use_amp=args.amp,
-        use_compile=args.compile,
-        use_flash_attn=args.flash_attn,
-        use_custom_triton=args.custom_triton,
-    )
+
+    if args.fsdp:
+        mp.set_start_method("spawn", force=True)
+        mp.spawn(
+            train_worker,
+            args=(args.world_size, True, args.config, args.amp, args.compile, args.flash_attn, args.custom_triton),
+            nprocs=args.world_size,
+            join=True,
+        )
+    else:
+        train_worker(
+            rank=0,
+            world_size=1,
+            use_fsdp=False,
+            config_path=args.config,
+            use_amp=args.amp,
+            use_compile=args.compile,
+            use_flash_attn=args.flash_attn,
+            use_custom_triton=args.custom_triton,
+        )
 
 
 if __name__ == "__main__":
