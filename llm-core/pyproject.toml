@@ -7,7 +7,7 @@ dependencies = [
     "einops>=0.8.1",
     "jaxtyping>=0.3.0",
     "numpy",
-    "torch~=2.6.0; sys_platform != 'darwin' or platform_machine != 'x86_64'",
+    "torch>=2.7; sys_platform != 'darwin' or platform_machine != 'x86_64'",
     "torch~=2.2.2; sys_platform == 'darwin' and platform_machine == 'x86_64'",
 ]
 
