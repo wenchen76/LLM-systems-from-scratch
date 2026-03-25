@@ -85,6 +85,14 @@ class FSDPUnit:
         # Flatten all parameters into a single contiguous tensor
         flat_full = torch.cat([p.data.detach().flatten() for p in params])
 
+        # Broadcast rank 0's init to all ranks so every shard is computed from
+        # the SAME source weights. Without this, each rank shards from its own
+        # independently-random-initialized module and the reconstructed "full"
+        # model is a Frankenstein of world_size different inits — equivalent to
+        # starting training from a pathologically bad initialization.
+        if dist.is_initialized() and self.world_size > 1:
+            dist.broadcast(flat_full, src=0, group=self.process_group)
+
         # Pad to be divisible by world_size
         total_numel = flat_full.numel()
         padded_numel = ((total_numel + self.world_size - 1) // self.world_size) * self.world_size
@@ -231,11 +239,11 @@ class FSDPUnit:
 class FSDP(torch.nn.Module):
     """Fully Sharded Data Parallelism wrapper with ZeRO-3.
 
-    Wraps a BasicsTransformerLM (or similar model with a `.layers` ModuleList)
+    Wraps a TransformerLM (or similar model with a `.layers` ModuleList)
     and shards parameters, gradients, and optimizer states across ranks.
 
     Usage:
-        model = BasicsTransformerLM(...).to(device)
+        model = TransformerLM(...).to(device)
         fsdp_model = FSDP(model)
         optimizer = AdamW(fsdp_model.parameters(), lr=1e-3)
 
