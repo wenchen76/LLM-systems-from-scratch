@@ -296,6 +296,17 @@ def main():
     parser.add_argument("--world-size", type=int, default=2, help="Number of GPUs for FSDP (default: 2)")
     args = parser.parse_args()
 
+    # TODO: support --compile + --fsdp by reusing a persistent flat_full buffer
+    # in FSDPUnit so that param data_ptr stays stable across forwards, which is
+    # required for torch.compile's dynamo guards.
+    if args.fsdp and args.compile:
+        raise ValueError(
+            "--fsdp and --compile are not yet compatible: the custom FSDP "
+            "implementation swaps param.data on every forward, which "
+            "invalidates torch.compile's compiled graph. "
+            "Use one or the other for now."
+        )
+
     if args.fsdp:
         mp.set_start_method("spawn", force=True)
         mp.spawn(
