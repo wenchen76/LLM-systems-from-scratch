@@ -75,13 +75,19 @@ def load_config(path: str) -> dict:
 def train_worker(
     rank: int = 0,
     world_size: int = 1,
-    use_fsdp: bool = False,
+    parallel: list[str] | None = None,
     config_path: str = "./configures/sample.yaml",
     use_amp: bool = False,
     use_compile: bool = False,
     use_flash_attn: bool = False,
     use_custom_triton: bool = False,
 ):
+    if parallel is None:
+        parallel = []
+    use_distributed = len(parallel) > 0
+    use_fsdp = "fsdp" in parallel
+    use_ddp = "ddp" in parallel
+
     torch.set_float32_matmul_precision("high")
     config = load_config(config_path)
     model_cfg = config["model"]
@@ -102,14 +108,13 @@ def train_worker(
     lr_min = float(optim_cfg["learning_rate_min"])
     max_grad_norm = optim_cfg["max_grad_norm"]
 
-    if use_fsdp:
+    if use_distributed:
         os.environ.setdefault("MASTER_ADDR", "localhost")
         os.environ.setdefault("MASTER_PORT", "29500")
         dist.init_process_group("nccl", rank=rank, world_size=world_size)
         local_rank = rank % torch.cuda.device_count()
         torch.cuda.set_device(local_rank)
         device = f"cuda:{local_rank}"
-        # Only rank 0 logs to wandb
         if rank != 0:
             use_wandb = False
     else:
@@ -118,8 +123,8 @@ def train_worker(
 
     if use_wandb:
         run_name = f"bs{batch_size}_lr{lr_max}_layer{model_cfg['num_layers']}"
-        if use_fsdp:
-            run_name += f"_fsdp_ws{world_size}"
+        if use_distributed:
+            run_name += f"_{'+'.join(parallel)}_ws{world_size}"
         wandb.init(
             project=train_cfg["wandb_project"],
             name=run_name,
@@ -129,7 +134,7 @@ def train_worker(
                 "context_length": context_length,
                 "d_model": model_cfg["d_model"],
                 "max_steps": max_steps,
-                "use_fsdp": use_fsdp,
+                "parallel": parallel,
                 "world_size": world_size,
             },
         )
@@ -159,6 +164,9 @@ def train_worker(
     if use_fsdp:
         from llm_systems.parallelism.fsdp_zero3 import FSDP
         model = FSDP(model)
+    elif use_ddp:
+        from llm_systems.parallelism.ddp import DDP
+        model = DDP(model)
 
     model.train()
     if use_custom_triton:
@@ -175,8 +183,8 @@ def train_worker(
         weight_decay=float(optim_cfg["weight_decay"]),
     )
 
-    # Under FSDP each rank processes a slice of the global batch.
-    local_batch_size = batch_size // world_size if use_fsdp else batch_size
+    # Under distributed training each rank processes a slice of the global batch.
+    local_batch_size = batch_size // world_size if use_distributed else batch_size
 
     for step in range(max_steps):
         if device == "cuda":
@@ -208,7 +216,7 @@ def train_worker(
             logits = model(x)
             loss = cross_entropy_fn(logits.view(-1, logits.size(-1)), y.view(-1))
         loss.backward()
-        if use_fsdp:
+        if use_distributed:
             model.finish_gradient_synchronization()
         clip_gradient(model.parameters(), max_grad_norm)
         optimizer.step()
@@ -241,12 +249,13 @@ def train_worker(
             model.train()
 
         if step % val_interval == 0 and step > 0 and not use_fsdp:
-            save_checkpoint(
-                model=inner_model,
-                optimizer=optimizer,
-                iteration=step,
-                path=os.path.join(checkpoint_dir, f"ckpt_{step}.pt"),
-            )
+            if not use_distributed or rank == 0:
+                save_checkpoint(
+                    model=inner_model,
+                    optimizer=optimizer,
+                    iteration=step,
+                    path=os.path.join(checkpoint_dir, f"ckpt_{step}.pt"),
+                )
 
         if use_wandb and step % gpu_log_interval == 0:
             allocated_memory = int(torch.cuda.memory_allocated() / 1024**2)
@@ -275,7 +284,14 @@ def train_worker(
             )
         for unit in model.fsdp_units:
             unit.discard_full_params()
-        dist.destroy_process_group()
+    elif use_distributed:
+        if rank == 0:
+            save_checkpoint(
+                model=inner_model,
+                optimizer=optimizer,
+                iteration=max_steps,
+                path=os.path.join(checkpoint_dir, "ckpt_final.pt"),
+            )
     else:
         save_checkpoint(
             model=inner_model,
@@ -283,6 +299,9 @@ def train_worker(
             iteration=max_steps,
             path=os.path.join(checkpoint_dir, "ckpt_final.pt"),
         )
+
+    if use_distributed:
+        dist.destroy_process_group()
 
 
 def main():
@@ -292,26 +311,32 @@ def main():
     parser.add_argument("--compile", action="store_true", help="Enable torch.compile for faster training")
     parser.add_argument("--flash-attn", action="store_true", help="Use PyTorch's scaled_dot_product_attention (FlashAttention2)")
     parser.add_argument("--custom-triton", action="store_true", help="Use custom Triton kernels in place of the Pytorch implementations")
-    parser.add_argument("--fsdp", action="store_true", help="Enable FSDP ZeRO-3 distributed training")
-    parser.add_argument("--world-size", type=int, default=2, help="Number of GPUs for FSDP (default: 2)")
+    parser.add_argument("--parallel", nargs="+", default=[], choices=["ddp", "fsdp"],
+                        help="Parallelism strategies (e.g., --parallel ddp, --parallel fsdp)")
+    parser.add_argument("--world-size", type=int, default=2, help="Number of GPUs for distributed training (default: 2)")
     args = parser.parse_args()
 
-    # TODO: support --compile + --fsdp by reusing a persistent flat_full buffer
+    parallel = args.parallel
+
+    if "ddp" in parallel and "fsdp" in parallel:
+        raise ValueError("--parallel ddp and fsdp are mutually exclusive (both are data parallelism)")
+
+    # TODO: support --compile + --parallel fsdp by reusing a persistent flat_full buffer
     # in FSDPUnit so that param data_ptr stays stable across forwards, which is
     # required for torch.compile's dynamo guards.
-    if args.fsdp and args.compile:
+    if "fsdp" in parallel and args.compile:
         raise ValueError(
-            "--fsdp and --compile are not yet compatible: the custom FSDP "
+            "--parallel fsdp and --compile are not yet compatible: the custom FSDP "
             "implementation swaps param.data on every forward, which "
             "invalidates torch.compile's compiled graph. "
             "Use one or the other for now."
         )
 
-    if args.fsdp:
+    if parallel:
         mp.set_start_method("spawn", force=True)
         mp.spawn(
             train_worker,
-            args=(args.world_size, True, args.config, args.amp, args.compile, args.flash_attn, args.custom_triton),
+            args=(args.world_size, parallel, args.config, args.amp, args.compile, args.flash_attn, args.custom_triton),
             nprocs=args.world_size,
             join=True,
         )
@@ -319,7 +344,7 @@ def main():
         train_worker(
             rank=0,
             world_size=1,
-            use_fsdp=False,
+            parallel=[],
             config_path=args.config,
             use_amp=args.amp,
             use_compile=args.compile,
