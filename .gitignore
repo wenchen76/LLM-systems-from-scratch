@@ -33,3 +33,6 @@ logs/
 # Environment
 .env
 .env.local
+
+# Benchmark output
+bench_baseline.json

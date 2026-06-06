@@ -221,8 +221,8 @@ class TransformerLM(nn.Module):
             # Top-k filtering
             if top_k:
                 top_values, _ = torch.topk(scaled_logits, min(top_k, scaled_logits.size(-1)))
-                threshold = top_values[:, -1]
-                scaled_logits.masked_fill(scaled_logits < threshold, float("-inf"))
+                threshold = top_values[:, -1:]  # (batch, 1) so it broadcasts over vocab
+                scaled_logits = scaled_logits.masked_fill(scaled_logits < threshold, float("-inf"))
 
             probs = softmax(scaled_logits, dim=-1)
             next_id = torch.multinomial(probs, 1)
