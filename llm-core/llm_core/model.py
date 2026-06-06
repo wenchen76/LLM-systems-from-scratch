@@ -325,6 +325,33 @@ def scaled_dot_product_attention (
     return einsum(attention_weights, V, "... query key, ... key d_v -> ... query d_v")
 
 
+class KVCache:
+    """Per-layer key/value cache for incremental (autoregressive) decoding.
+
+    Holds K and V of shape (batch, num_heads, seq, d_head), growing along the
+    sequence dim as tokens are appended. One instance per attention layer; the
+    model owns a list of them (see TransformerLM.new_kv_cache).
+
+    This is mutated in place so attention can keep returning a plain tensor,
+    leaving the training / full-forward path untouched.
+    """
+
+    def __init__(self):
+        self.k: torch.Tensor | None = None
+        self.v: torch.Tensor | None = None
+
+    @property
+    def length(self) -> int:
+        """Number of tokens currently cached."""
+        return 0 if self.k is None else self.k.size(-2)
+
+    def append(self, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Append new keys/values and return the full cached K, V."""
+        self.k = k if self.k is None else torch.cat((self.k, k), dim=-2)
+        self.v = v if self.v is None else torch.cat((self.v, v), dim=-2)
+        return self.k, self.v
+
+
 class CausalMultiHeadSelfAttention(nn.Module):
     """Causal multi-head self-attention with RoPE."""
 
@@ -354,6 +381,7 @@ class CausalMultiHeadSelfAttention(nn.Module):
         self,
         x: Float[Tensor, " ... seq d_model"],
         token_positions: Int[Tensor, " ... seq"] | None = None,
+        kv_cache: KVCache | None = None,
     ) -> Float[Tensor, " ... seq d_model"]:
         *batch_dims, seq_len, d_model = x.size()
         assert d_model == self.d_model
@@ -369,20 +397,39 @@ class CausalMultiHeadSelfAttention(nn.Module):
             for t in (Q, K, V)
         )
 
-        # Apply RoPE to Q and K
+        # Apply RoPE. New tokens are positioned after whatever is already cached;
+        # with no cache past_len == 0, so this reduces to arange(seq_len).
+        past_len = kv_cache.length if kv_cache is not None else 0
         if token_positions is None:
-            token_positions = torch.arange(seq_len, device=x.device).view(*([1] * len(batch_dims)), seq_len)
+            token_positions = torch.arange(
+                past_len, past_len + seq_len, device=x.device
+            ).view(*([1] * len(batch_dims)), seq_len)
         # Expand for heads: (..., seq) -> (..., 1, seq)
         token_positions = rearrange(token_positions, "... seq -> ... 1 seq")
         Q = self.positional_encoder(Q, token_positions)
         K = self.positional_encoder(K, token_positions)
 
         # Attention
-        if self.use_flash_attn:
-            attn_output = torch.nn.functional.scaled_dot_product_attention(Q, K, V, is_causal=True)
+        if kv_cache is None:
+            # Full forward / training path (unchanged).
+            if self.use_flash_attn:
+                attn_output = torch.nn.functional.scaled_dot_product_attention(Q, K, V, is_causal=True)
+            else:
+                causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool))
+                attn_output = scaled_dot_product_attention(Q, K, V, causal_mask)
         else:
-            causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool))
-            attn_output = scaled_dot_product_attention(Q, K, V, causal_mask)
+            # Incremental path: append new K/V, then attend over the full history.
+            K, V = kv_cache.append(K, V)
+            kv_len = K.size(-2)
+            # Query i is at absolute position past_len + i and may attend to keys
+            # 0..past_len+i. For pure decode (seq_len == 1) this keeps every key.
+            q_pos = torch.arange(past_len, past_len + seq_len, device=x.device).unsqueeze(-1)
+            k_pos = torch.arange(kv_len, device=x.device).unsqueeze(0)
+            attn_mask = k_pos <= q_pos  # (seq_len, kv_len), True = attend
+            if self.use_flash_attn:
+                attn_output = torch.nn.functional.scaled_dot_product_attention(Q, K, V, attn_mask=attn_mask)
+            else:
+                attn_output = scaled_dot_product_attention(Q, K, V, attn_mask)
 
         # Merge heads: (..., num_heads, seq, d_head) -> (..., seq, num_heads * d_head)
         attn_output = rearrange(attn_output, "... heads seq d_head -> ... seq (heads d_head)").contiguous()
