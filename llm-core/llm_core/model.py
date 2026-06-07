@@ -107,6 +107,32 @@ class RotaryEmbedding(nn.Module):
         return f"context_length={self._freq_cache.shape[1]}, d={self._freq_cache.shape[2] * 2}"
 
 
+def pack_varlen(sequences: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pack ragged sequences into flat tensors for selective batching.
+
+    Args:
+        sequences: list of 1-D token-id tensors, possibly of different lengths.
+
+    Returns:
+        flat_ids: (total_tokens,) all tokens concatenated, with no padding.
+        cu_seqlens: (num_seqs + 1,) cumulative lengths, cu_seqlens[0] == 0.
+        position_ids: (total_tokens,) per-sequence positions, each restarting at 0.
+    """
+    device = sequences[0].device
+    flat_ids = torch.cat([s.reshape(-1) for s in sequences])
+    lengths = torch.tensor([s.numel() for s in sequences], device=device)
+    cu_seqlens = torch.cat([torch.zeros(1, dtype=torch.long, device=device), lengths.cumsum(0)])
+    position_ids = torch.cat([torch.arange(s.numel(), device=device) for s in sequences])
+    return flat_ids, cu_seqlens, position_ids
+
+
+def varlen_position_ids(cu_seqlens: torch.Tensor) -> torch.Tensor:
+    """Per-sequence positions (each restarting at 0) for a packed varlen batch."""
+    bounds = cu_seqlens.tolist()
+    device = cu_seqlens.device
+    return torch.cat([torch.arange(end - start, device=device) for start, end in zip(bounds[:-1], bounds[1:])])
+
+
 class TransformerLM(nn.Module):
     """Decoder-only Transformer language model with RoPE, RMSNorm, and SwiGLU.
 
@@ -193,6 +219,37 @@ class TransformerLM(nn.Module):
     def new_kv_cache(self) -> list[KVCache]:
         """Create a fresh, empty KV cache (one KVCache per layer) for decoding."""
         return [KVCache() for _ in self.layers]
+
+    @torch.no_grad()
+    def forward_varlen(
+        self,
+        token_ids: Int[Tensor, " total_tokens"],
+        cu_seqlens: Int[Tensor, " num_seqs_plus_1"],
+        position_ids: Int[Tensor, " total_tokens"] | None = None,
+    ) -> Float[Tensor, " total_tokens vocab_size"]:
+        """Selective-batching forward over a flat, ragged batch (no padding).
+
+        Multiple sequences of different lengths are concatenated along a single
+        token axis. Token-wise layers run on the whole flat batch at once; only
+        attention is computed per sequence, bounded by cu_seqlens. See
+        pack_varlen for building the inputs.
+
+        Args:
+            token_ids: (total_tokens,) all sequences' tokens concatenated.
+            cu_seqlens: (num_seqs + 1,) cumulative lengths, cu_seqlens[0] == 0.
+            position_ids: (total_tokens,) per-token positions; derived from
+                cu_seqlens (each sequence restarting at 0) when None.
+
+        Returns:
+            logits of shape (total_tokens, vocab_size).
+        """
+        if position_ids is None:
+            position_ids = varlen_position_ids(cu_seqlens)
+        x = self.token_embeddings(token_ids)  # (total_tokens, d_model)
+        for layer in self.layers:
+            x = layer.forward_varlen(x, cu_seqlens, position_ids)  # (total_tokens, d_model)
+        x = self.final_norm(x)                 # (total_tokens, d_model)
+        return self.lm_head(x)                 # (total_tokens, vocab_size)
 
     @torch.no_grad()
     def prefill(
@@ -370,6 +427,16 @@ class TransformerBlock(nn.Module):
         x = x + self.ffn(self.ffn_norm(x))
         return x
 
+    def forward_varlen(
+        self,
+        x: Float[Tensor, " total_tokens d_model"],
+        cu_seqlens: Int[Tensor, " num_seqs_plus_1"],
+        position_ids: Int[Tensor, " total_tokens"],
+    ) -> Float[Tensor, " total_tokens d_model"]:
+        x = x + self.attn.forward_varlen(self.attn_norm(x), cu_seqlens, position_ids)
+        x = x + self.ffn(self.ffn_norm(x))
+        return x
+
 
 class SwiGLU(nn.Module):
     """SwiGLU feed-forward: W2(SiLU(W1(x)) * W3(x))."""
@@ -514,6 +581,59 @@ class CausalMultiHeadSelfAttention(nn.Module):
         attn_output = rearrange(attn_output, "... heads seq d_head -> ... seq (heads d_head)").contiguous()
 
         return self.output_proj(attn_output)
+
+    def forward_varlen(
+        self,
+        x: Float[Tensor, " total_tokens d_model"],
+        cu_seqlens: Int[Tensor, " num_seqs_plus_1"],
+        position_ids: Int[Tensor, " total_tokens"],
+    ) -> Float[Tensor, " total_tokens d_model"]:
+        """Selective-batching attention over a flat, ragged batch.
+
+        Sequences are concatenated along one token axis with no padding;
+        cu_seqlens marks their boundaries and position_ids gives each token's
+        per-sequence position. Projections run on the whole flat batch at once;
+        only attention is done per sequence (causally), since attention is the
+        single op that mixes the sequence dimension.
+
+        (Production stacks fuse this into flash_attn_varlen_func, which is
+        CUDA-only; here it is done explicitly per block.)
+        """
+        total_tokens, d_model = x.shape
+        assert d_model == self.d_model
+
+        # Token-wise projections over the entire flat batch (no padding).
+        Q = self.q_proj(x)
+        K = self.k_proj(x)
+        V = self.v_proj(x)
+        Q, K, V = (
+            rearrange(t, "tokens (heads d) -> heads tokens d", heads=self.num_heads)
+            for t in (Q, K, V)
+        )  # (heads, total_tokens, d_head)
+
+        # Per-token RoPE; (1, total_tokens) broadcasts over the head dim.
+        pos = position_ids.view(1, total_tokens)
+        Q = self.positional_encoder(Q, pos)
+        K = self.positional_encoder(K, pos)
+
+        # Attend within each sequence block (causal), then stitch back together.
+        # The mask is built explicitly (True = attend) rather than via is_causal,
+        # so the same path generalizes to the non-square decode masks in Phase 4.
+        bounds = cu_seqlens.tolist()
+        outputs = []
+        for start, end in zip(bounds[:-1], bounds[1:]):
+            length = end - start
+            q, k, v = Q[:, start:end], K[:, start:end], V[:, start:end]  # (heads, length, d_head)
+            causal_mask = torch.tril(torch.ones(length, length, device=x.device, dtype=torch.bool))
+            if self.use_flash_attn:
+                outputs.append(torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=causal_mask))
+            else:
+                outputs.append(scaled_dot_product_attention(q, k, v, causal_mask))
+        attn_output = torch.cat(outputs, dim=1)  # (heads, total_tokens, d_head)
+
+        attn_output = rearrange(attn_output, "heads tokens d -> tokens (heads d)").contiguous()
+        return self.output_proj(attn_output)
+
 
 def silu(x: torch.Tensor):
     return x * torch.sigmoid(x)
