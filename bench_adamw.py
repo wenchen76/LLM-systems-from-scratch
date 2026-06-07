@@ -2,10 +2,14 @@
 
 AdamW is memory-bandwidth-bound (pure elementwise, no reuse), so the figure of
 merit is effective bandwidth: the kernel moves 7N transactions (read p,g,m,v;
-write p,m,v) versus the 12N of the unfused update. We report ms and GB/s for the
-fused kernel and llm_core.optimizer.AdamW — the pure-PyTorch implementation the
-fused kernel replaces — so the speedup reflects only fusion, not an algorithm or
-eps difference.
+write p,m,v) versus the 12N of the unfused update. We report ms and GB/s for
+three optimizers:
+  - fused: our Triton FusedAdamW
+  - ref:   llm_core.optimizer.AdamW, the pure-PyTorch (eager) implementation the
+           kernel replaces — same algorithm, so "x_ref" isolates fusion + the
+           launch/temporary overhead the eager version pays.
+  - torchF: torch.optim.AdamW(fused=True), PyTorch's own fused CUDA kernel — the
+           honest "production-grade" comparison ("x_torchF").
 
 CUDA + Triton only.
 
@@ -30,10 +34,10 @@ def bytes_per_element(param_dtype: torch.dtype) -> int:
     return reads + writes
 
 
-def make_step(optimizer_cls, n, dtype):
+def make_step(build_opt, n, dtype):
     p = torch.randn(n, device="cuda", dtype=dtype, requires_grad=True)
     p.grad = torch.randn_like(p)
-    opt = optimizer_cls([p])
+    opt = build_opt([p])
 
     def step():
         opt.step()
@@ -55,16 +59,19 @@ def main():
     elem_bytes = bytes_per_element(dtype)
     print(f"device={torch.cuda.get_device_name()} dtype={args.dtype} "
           f"bytes/elem={elem_bytes}")
-    print(f"{'N':>12} | {'fused ms':>9} {'fused GB/s':>11} | "
-          f"{'ref ms':>9} {'ref GB/s':>11} | {'speedup':>8}")
-    print("-" * 78)
+    print(f"{'N':>10} | {'fused ms':>8} {'GB/s':>7} | {'ref ms':>8} {'GB/s':>7} | "
+          f"{'torchF ms':>9} {'GB/s':>7} | {'x_ref':>6} {'x_torchF':>8}")
+    print("-" * 88)
 
     for n in args.sizes:
-        fused_ms = triton.testing.do_bench(make_step(FusedAdamW, n, dtype))
-        ref_ms = triton.testing.do_bench(make_step(ReferenceAdamW, n, dtype))
+        fused_ms = triton.testing.do_bench(make_step(lambda ps: FusedAdamW(ps), n, dtype))
+        ref_ms = triton.testing.do_bench(make_step(lambda ps: ReferenceAdamW(ps), n, dtype))
+        torch_ms = triton.testing.do_bench(make_step(lambda ps: torch.optim.AdamW(ps, fused=True), n, dtype))
         gbps = lambda ms: n * elem_bytes / (ms * 1e-3) / 1e9  # noqa: E731
-        print(f"{n:>12} | {fused_ms:>9.3f} {gbps(fused_ms):>11.1f} | "
-              f"{ref_ms:>9.3f} {gbps(ref_ms):>11.1f} | {ref_ms / fused_ms:>7.2f}x")
+        print(f"{n:>10} | {fused_ms:>8.3f} {gbps(fused_ms):>7.1f} | "
+              f"{ref_ms:>8.3f} {gbps(ref_ms):>7.1f} | "
+              f"{torch_ms:>9.3f} {gbps(torch_ms):>7.1f} | "
+              f"{ref_ms / fused_ms:>5.2f}x {torch_ms / fused_ms:>7.2f}x")
 
 
 if __name__ == "__main__":
