@@ -226,6 +226,7 @@ class TransformerLM(nn.Module):
         token_ids: Int[Tensor, " total_tokens"],
         cu_seqlens: Int[Tensor, " num_seqs_plus_1"],
         position_ids: Int[Tensor, " total_tokens"] | None = None,
+        request_kv_caches: list[list[KVCache]] | None = None,
     ) -> Float[Tensor, " total_tokens vocab_size"]:
         """Selective-batching forward over a flat, ragged batch (no padding).
 
@@ -238,16 +239,24 @@ class TransformerLM(nn.Module):
             token_ids: (total_tokens,) all sequences' tokens concatenated.
             cu_seqlens: (num_seqs + 1,) cumulative lengths, cu_seqlens[0] == 0.
             position_ids: (total_tokens,) per-token positions; derived from
-                cu_seqlens (each sequence restarting at 0) when None.
+                cu_seqlens (each sequence restarting at 0) when None. Must be
+                supplied (as absolute positions) when request_kv_caches is given.
+            request_kv_caches: one per sequence, each a per-layer list[KVCache]
+                (i.e. the output of new_kv_cache). Enables the mixed prefill+decode
+                path of continuous batching, where each sequence attends over its
+                own cached history. When None, every sequence is a fresh prefill.
 
         Returns:
             logits of shape (total_tokens, vocab_size).
         """
         if position_ids is None:
+            if request_kv_caches is not None:
+                raise ValueError("position_ids (absolute) must be provided when using KV caches")
             position_ids = varlen_position_ids(cu_seqlens)
         x = self.token_embeddings(token_ids)  # (total_tokens, d_model)
-        for layer in self.layers:
-            x = layer.forward_varlen(x, cu_seqlens, position_ids)  # (total_tokens, d_model)
+        for j, layer in enumerate(self.layers):
+            layer_caches = [rc[j] for rc in request_kv_caches] if request_kv_caches is not None else None
+            x = layer.forward_varlen(x, cu_seqlens, position_ids, layer_caches)  # (total_tokens, d_model)
         x = self.final_norm(x)                 # (total_tokens, d_model)
         return self.lm_head(x)                 # (total_tokens, vocab_size)
 
@@ -432,8 +441,9 @@ class TransformerBlock(nn.Module):
         x: Float[Tensor, " total_tokens d_model"],
         cu_seqlens: Int[Tensor, " num_seqs_plus_1"],
         position_ids: Int[Tensor, " total_tokens"],
+        kv_caches: list[KVCache] | None = None,
     ) -> Float[Tensor, " total_tokens d_model"]:
-        x = x + self.attn.forward_varlen(self.attn_norm(x), cu_seqlens, position_ids)
+        x = x + self.attn.forward_varlen(self.attn_norm(x), cu_seqlens, position_ids, kv_caches)
         x = x + self.ffn(self.ffn_norm(x))
         return x
 
@@ -587,14 +597,20 @@ class CausalMultiHeadSelfAttention(nn.Module):
         x: Float[Tensor, " total_tokens d_model"],
         cu_seqlens: Int[Tensor, " num_seqs_plus_1"],
         position_ids: Int[Tensor, " total_tokens"],
+        kv_caches: list[KVCache] | None = None,
     ) -> Float[Tensor, " total_tokens d_model"]:
         """Selective-batching attention over a flat, ragged batch.
 
         Sequences are concatenated along one token axis with no padding;
         cu_seqlens marks their boundaries and position_ids gives each token's
-        per-sequence position. Projections run on the whole flat batch at once;
-        only attention is done per sequence (causally), since attention is the
-        single op that mixes the sequence dimension.
+        absolute position. Projections run on the whole flat batch at once; only
+        attention is done per sequence, since attention is the single op that
+        mixes the sequence dimension.
+
+        When kv_caches is given (one KVCache per sequence, each holding this
+        layer's (heads, seq, d_head)), every sequence attends over its cached
+        history plus its new tokens — the mixed prefill+decode path used by
+        continuous batching. Without it, each sequence is a fresh prefill.
 
         (Production stacks fuse this into flash_attn_varlen_func, which is
         CUDA-only; here it is done explicitly per block.)
@@ -611,24 +627,32 @@ class CausalMultiHeadSelfAttention(nn.Module):
             for t in (Q, K, V)
         )  # (heads, total_tokens, d_head)
 
-        # Per-token RoPE; (1, total_tokens) broadcasts over the head dim.
+        # Per-token RoPE with absolute positions; (1, total_tokens) broadcasts over heads.
         pos = position_ids.view(1, total_tokens)
         Q = self.positional_encoder(Q, pos)
         K = self.positional_encoder(K, pos)
 
-        # Attend within each sequence block (causal), then stitch back together.
-        # The mask is built explicitly (True = attend) rather than via is_causal,
-        # so the same path generalizes to the non-square decode masks in Phase 4.
+        # Attend within each sequence block, then stitch back together. Masks are
+        # built explicitly (True = attend) so the non-square decode case works.
         bounds = cu_seqlens.tolist()
         outputs = []
-        for start, end in zip(bounds[:-1], bounds[1:]):
-            length = end - start
-            q, k, v = Q[:, start:end], K[:, start:end], V[:, start:end]  # (heads, length, d_head)
-            causal_mask = torch.tril(torch.ones(length, length, device=x.device, dtype=torch.bool))
-            if self.use_flash_attn:
-                outputs.append(torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=causal_mask))
+        for i, (start, end) in enumerate(zip(bounds[:-1], bounds[1:])):
+            q, k, v = Q[:, start:end], K[:, start:end], V[:, start:end]  # (heads, q_len, d_head)
+            q_len = end - start
+            if kv_caches is None:
+                attn_mask = torch.tril(torch.ones(q_len, q_len, device=x.device, dtype=torch.bool))
             else:
-                outputs.append(scaled_dot_product_attention(q, k, v, causal_mask))
+                past_len = kv_caches[i].length
+                k, v = kv_caches[i].append(k, v)  # (heads, past_len + q_len, d_head)
+                kv_len = k.size(-2)
+                # Query a (absolute position past_len + a) attends to keys 0..past_len+a.
+                q_pos = torch.arange(past_len, past_len + q_len, device=x.device).unsqueeze(-1)
+                k_pos = torch.arange(kv_len, device=x.device).unsqueeze(0)
+                attn_mask = k_pos <= q_pos  # (q_len, kv_len)
+            if self.use_flash_attn:
+                outputs.append(torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask))
+            else:
+                outputs.append(scaled_dot_product_attention(q, k, v, attn_mask))
         attn_output = torch.cat(outputs, dim=1)  # (heads, total_tokens, d_head)
 
         attn_output = rearrange(attn_output, "heads tokens d -> tokens (heads d)").contiguous()
