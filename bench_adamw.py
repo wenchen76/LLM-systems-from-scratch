@@ -2,8 +2,10 @@
 
 AdamW is memory-bandwidth-bound (pure elementwise, no reuse), so the figure of
 merit is effective bandwidth: the kernel moves 7N transactions (read p,g,m,v;
-write p,m,v) versus the 12N of unfused AdamW. We report ms and GB/s for the
-fused kernel and torch.optim.AdamW (foreach) across parameter sizes.
+write p,m,v) versus the 12N of the unfused update. We report ms and GB/s for the
+fused kernel and llm_core.optimizer.AdamW — the pure-PyTorch implementation the
+fused kernel replaces — so the speedup reflects only fusion, not an algorithm or
+eps difference.
 
 CUDA + Triton only.
 
@@ -15,6 +17,7 @@ import argparse
 import torch
 import triton
 
+from llm_core.optimizer import AdamW as ReferenceAdamW
 from llm_systems.kernels.triton_adamw import FusedAdamW
 
 
@@ -27,10 +30,10 @@ def bytes_per_element(param_dtype: torch.dtype) -> int:
     return reads + writes
 
 
-def make_step(optimizer_cls, n, dtype, **kwargs):
+def make_step(optimizer_cls, n, dtype):
     p = torch.randn(n, device="cuda", dtype=dtype, requires_grad=True)
     p.grad = torch.randn_like(p)
-    opt = optimizer_cls([p], **kwargs)
+    opt = optimizer_cls([p])
 
     def step():
         opt.step()
@@ -53,15 +56,15 @@ def main():
     print(f"device={torch.cuda.get_device_name()} dtype={args.dtype} "
           f"bytes/elem={elem_bytes}")
     print(f"{'N':>12} | {'fused ms':>9} {'fused GB/s':>11} | "
-          f"{'torch ms':>9} {'torch GB/s':>11} | {'speedup':>8}")
+          f"{'ref ms':>9} {'ref GB/s':>11} | {'speedup':>8}")
     print("-" * 78)
 
     for n in args.sizes:
         fused_ms = triton.testing.do_bench(make_step(FusedAdamW, n, dtype))
-        torch_ms = triton.testing.do_bench(make_step(torch.optim.AdamW, n, dtype, fused=False))
+        ref_ms = triton.testing.do_bench(make_step(ReferenceAdamW, n, dtype))
         gbps = lambda ms: n * elem_bytes / (ms * 1e-3) / 1e9  # noqa: E731
         print(f"{n:>12} | {fused_ms:>9.3f} {gbps(fused_ms):>11.1f} | "
-              f"{torch_ms:>9.3f} {gbps(torch_ms):>11.1f} | {torch_ms / fused_ms:>7.2f}x")
+              f"{ref_ms:>9.3f} {gbps(ref_ms):>11.1f} | {ref_ms / fused_ms:>7.2f}x")
 
 
 if __name__ == "__main__":
