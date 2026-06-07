@@ -69,6 +69,25 @@ def test_generate_cached_matches_uncached():
 
 
 @torch.no_grad()
+def test_prefill_decode_step_matches_full_forward():
+    """The prefill() + decode_step() interface must reproduce the full-forward
+    logits at every position (same invariant as the cache, via the public API)."""
+    torch.manual_seed(0)
+    model = TransformerLM(**SMALL_CONFIG).eval()
+    gen = torch.Generator().manual_seed(99)
+    ids = torch.randint(0, SMALL_CONFIG["vocab_size"], (2, 12), generator=gen)
+
+    full = model(ids)  # (batch, seq, vocab)
+
+    # Prefill on all but the last token, then decode the rest one at a time.
+    logits, caches = model.prefill(ids[:, :-1])
+    assert torch.allclose(logits, full[:, -2], atol=1e-5)  # predicts the last token's position
+    logits, caches = model.decode_step(ids[:, -1], caches)
+    assert torch.allclose(logits, full[:, -1], atol=1e-5)
+    assert caches[0].length == ids.size(1)
+
+
+@torch.no_grad()
 def test_attention_prefill_then_decode_matches_full():
     """Prefill a chunk in one pass, then decode the rest one token at a time."""
     attn = build_attention(seed=3)

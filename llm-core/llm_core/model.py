@@ -194,6 +194,49 @@ class TransformerLM(nn.Module):
         """Create a fresh, empty KV cache (one KVCache per layer) for decoding."""
         return [KVCache() for _ in self.layers]
 
+    @torch.no_grad()
+    def prefill(
+        self,
+        prompt_ids: torch.Tensor,
+        kv_caches: list[KVCache] | None = None,
+    ) -> tuple[torch.Tensor, list[KVCache]]:
+        """Run the prompt through the model, populating a KV cache.
+
+        Args:
+            prompt_ids: Token IDs of shape (batch, seq) or (seq,).
+            kv_caches: Caches to fill; a fresh one is allocated if None.
+
+        Returns:
+            (logits, kv_caches), where logits are the last-position next-token
+            logits of shape (batch, vocab_size).
+        """
+        if prompt_ids.dim() == 1:
+            prompt_ids = prompt_ids.unsqueeze(0)
+        if kv_caches is None:
+            kv_caches = self.new_kv_cache()
+        logits = self.forward(prompt_ids, kv_caches=kv_caches)[:, -1]
+        return logits, kv_caches
+
+    @torch.no_grad()
+    def decode_step(
+        self,
+        token_ids: torch.Tensor,
+        kv_caches: list[KVCache],
+    ) -> tuple[torch.Tensor, list[KVCache]]:
+        """Decode a single step given the most recent token(s).
+
+        Args:
+            token_ids: The last token per sequence, shape (batch,) or (batch, 1).
+            kv_caches: The caches to extend (mutated in place).
+
+        Returns:
+            (logits, kv_caches), with logits of shape (batch, vocab_size).
+        """
+        if token_ids.dim() == 1:
+            token_ids = token_ids.unsqueeze(-1)  # (batch, 1)
+        logits = self.forward(token_ids, kv_caches=kv_caches)[:, -1]
+        return logits, kv_caches
+
     def _sample_next(self, logits: torch.Tensor, temperature: float, top_k: int | None) -> torch.Tensor:
         """Sample the next token id from last-step logits. Returns (batch, 1)."""
         scaled_logits = logits / temperature
@@ -253,9 +296,8 @@ class TransformerLM(nn.Module):
             return torch.cat(generated, dim=-1) if generated else prompt_ids[:, 0:0]
 
         # Cached path: prefill once, then decode one token at a time.
-        caches = self.new_kv_cache()
         prefill_ids = prompt_ids[:, -self.context_length:]  # fit the context window
-        logits = self.forward(prefill_ids, kv_caches=caches)[:, -1]  # (batch, vocab_size)
+        logits, caches = self.prefill(prefill_ids)
         generated = []
         for _ in range(max_new_tokens):
             next_id = self._sample_next(logits, temperature, top_k)
@@ -264,7 +306,7 @@ class TransformerLM(nn.Module):
             generated.append(next_id)
             if caches[0].length >= self.context_length:
                 break  # reached the absolute-position / context limit
-            logits = self.forward(next_id, kv_caches=caches)[:, -1]
+            logits, caches = self.decode_step(next_id, caches)
         return torch.cat(generated, dim=-1) if generated else prompt_ids[:, 0:0]
 
     @classmethod
