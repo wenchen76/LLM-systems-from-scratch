@@ -177,12 +177,32 @@ class TransformerLM(nn.Module):
             num_params -= self.lm_head.weight.numel()
         return num_params
 
-    def forward(self, token_ids: Int[Tensor, " ... seq"]) -> Float[Tensor, " ... seq vocab_size"]:
+    def forward(
+        self,
+        token_ids: Int[Tensor, " ... seq"],
+        token_positions: Int[Tensor, " ... seq"] | None = None,
+        kv_caches: list[KVCache] | None = None,
+    ) -> Float[Tensor, " ... seq vocab_size"]:
         x = self.token_embeddings(token_ids)  # (..., seq, d_model)
-        for layer in self.layers:
-            x = layer(x)                       # (..., seq, d_model)
+        for i, layer in enumerate(self.layers):
+            kv_cache = kv_caches[i] if kv_caches is not None else None
+            x = layer(x, token_positions=token_positions, kv_cache=kv_cache)  # (..., seq, d_model)
         x = self.final_norm(x)                 # (..., seq, d_model)
         return self.lm_head(x)                 # (..., seq, vocab_size)
+
+    def new_kv_cache(self) -> list[KVCache]:
+        """Create a fresh, empty KV cache (one KVCache per layer) for decoding."""
+        return [KVCache() for _ in self.layers]
+
+    def _sample_next(self, logits: torch.Tensor, temperature: float, top_k: int | None) -> torch.Tensor:
+        """Sample the next token id from last-step logits. Returns (batch, 1)."""
+        scaled_logits = logits / temperature
+        if top_k:
+            top_values, _ = torch.topk(scaled_logits, min(top_k, scaled_logits.size(-1)))
+            threshold = top_values[:, -1:]  # (batch, 1) so it broadcasts over vocab
+            scaled_logits = scaled_logits.masked_fill(scaled_logits < threshold, float("-inf"))
+        probs = softmax(scaled_logits, dim=-1)
+        return torch.multinomial(probs, 1)
 
     @torch.no_grad()
     def generate(
@@ -192,6 +212,7 @@ class TransformerLM(nn.Module):
         temperature: float = 1.0,
         top_k: int | None = None,
         eos_token_id: int | None = None,
+        use_cache: bool = True,
     ) -> torch.Tensor:
         """Autoregressive token generation with temperature scaling and optional top-k sampling.
 
@@ -201,39 +222,50 @@ class TransformerLM(nn.Module):
             temperature: Softmax temperature for sampling.
             top_k: If set, only sample from the top-k highest probability tokens.
             eos_token_id: If set, stop generation upon producing this token.
+            use_cache: If True (default), decode incrementally with a KV cache —
+                prefill the prompt once, then feed a single token per step. Yields
+                the same tokens as the no-cache path but avoids recomputing the
+                full sequence each step.
 
         Returns:
             Generated token IDs of shape (1, num_generated).
+
+        Note:
+            With use_cache, total length (prompt + generated) is capped at
+            context_length because RoPE positions are absolute. The no-cache path
+            instead slides a context_length window. The two agree as long as the
+            total stays within context_length (a sliding-window cache is future work).
         """
         if prompt_ids.dim() == 1:
             prompt_ids = prompt_ids.unsqueeze(0)
 
-        input_ids = prompt_ids
+        if not use_cache:
+            input_ids = prompt_ids
+            generated = []
+            for _ in range(max_new_tokens):
+                context_ids = input_ids[:, -self.context_length:]  # slide context window
+                logits = self.forward(context_ids)[:, -1]  # (batch, vocab_size)
+                next_id = self._sample_next(logits, temperature, top_k)
+                if eos_token_id is not None and next_id.item() == eos_token_id:
+                    break
+                input_ids = torch.cat((input_ids, next_id), dim=-1)
+                generated.append(next_id)
+            return torch.cat(generated, dim=-1) if generated else prompt_ids[:, 0:0]
+
+        # Cached path: prefill once, then decode one token at a time.
+        caches = self.new_kv_cache()
+        prefill_ids = prompt_ids[:, -self.context_length:]  # fit the context window
+        logits = self.forward(prefill_ids, kv_caches=caches)[:, -1]  # (batch, vocab_size)
         generated = []
         for _ in range(max_new_tokens):
-            # Truncate to context window
-            context_ids = input_ids[:, -self.context_length:] if input_ids.size(1) > self.context_length else input_ids
-
-            # Get next-token logits and apply temperature
-            logits = self.forward(context_ids)[:, -1]  # (1, vocab_size)
-            scaled_logits = logits / temperature
-
-            # Top-k filtering
-            if top_k:
-                top_values, _ = torch.topk(scaled_logits, min(top_k, scaled_logits.size(-1)))
-                threshold = top_values[:, -1:]  # (batch, 1) so it broadcasts over vocab
-                scaled_logits = scaled_logits.masked_fill(scaled_logits < threshold, float("-inf"))
-
-            probs = softmax(scaled_logits, dim=-1)
-            next_id = torch.multinomial(probs, 1)
-
+            next_id = self._sample_next(logits, temperature, top_k)
             if eos_token_id is not None and next_id.item() == eos_token_id:
                 break
-
-            input_ids = torch.cat((input_ids, next_id), dim=-1)
             generated.append(next_id)
-
-        return torch.cat(generated, dim=-1) if generated else input_ids[:, 0:0]
+            if caches[0].length >= self.context_length:
+                break  # reached the absolute-position / context limit
+            logits = self.forward(next_id, kv_caches=caches)[:, -1]
+        return torch.cat(generated, dim=-1) if generated else prompt_ids[:, 0:0]
 
     @classmethod
     def from_pretrained(cls, config_path: str, checkpoint_path: str) -> TransformerLM:
@@ -286,8 +318,13 @@ class TransformerBlock(nn.Module):
             self.attn_norm = RMSNorm(d_model)
             self.ffn_norm = RMSNorm(d_model)
 
-    def forward(self, x: Float[Tensor, " ... seq d_model"]) -> Float[Tensor, " ... seq d_model"]:
-        x = x + self.attn(self.attn_norm(x))
+    def forward(
+        self,
+        x: Float[Tensor, " ... seq d_model"],
+        token_positions: Int[Tensor, " ... seq"] | None = None,
+        kv_cache: KVCache | None = None,
+    ) -> Float[Tensor, " ... seq d_model"]:
+        x = x + self.attn(self.attn_norm(x), token_positions=token_positions, kv_cache=kv_cache)
         x = x + self.ffn(self.ffn_norm(x))
         return x
 

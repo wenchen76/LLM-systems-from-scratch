@@ -7,7 +7,17 @@ the full model.
 """
 import torch
 
-from llm_core.model import CausalMultiHeadSelfAttention, KVCache, RotaryEmbedding
+from llm_core.model import CausalMultiHeadSelfAttention, KVCache, RotaryEmbedding, TransformerLM
+
+SMALL_CONFIG = {
+    "vocab_size": 256,
+    "context_length": 64,
+    "d_model": 64,
+    "num_layers": 2,
+    "num_heads": 4,
+    "d_ff": 128,
+    "rope_theta": 10000.0,
+}
 
 D_MODEL = 64
 NUM_HEADS = 4
@@ -35,6 +45,27 @@ def test_attention_token_by_token_matches_full():
 
     assert cache.length == x.size(1)
     assert torch.allclose(full, incremental, atol=1e-5), (full - incremental).abs().max().item()
+
+
+@torch.no_grad()
+def test_generate_cached_matches_uncached():
+    """End-to-end: cached generate == no-cache generate, token-for-token.
+
+    Uses greedy (top_k=1) so the comparison is robust to tiny float differences
+    between the two paths, and keeps total length within context_length where the
+    absolute-position cache and the sliding-window no-cache path are equivalent.
+    """
+    torch.manual_seed(0)
+    model = TransformerLM(**SMALL_CONFIG).eval()
+    gen = torch.Generator().manual_seed(1234)
+    prompt = torch.randint(0, SMALL_CONFIG["vocab_size"], (1, 8), generator=gen)
+
+    max_new = SMALL_CONFIG["context_length"] - prompt.size(1)  # stay within the window
+    cached = model.generate(prompt, max_new_tokens=max_new, top_k=1, use_cache=True)
+    uncached = model.generate(prompt, max_new_tokens=max_new, top_k=1, use_cache=False)
+
+    assert torch.equal(cached, uncached)
+    assert cached.size(1) == max_new
 
 
 @torch.no_grad()

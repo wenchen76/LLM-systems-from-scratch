@@ -79,6 +79,8 @@ def main():
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-k", type=int, default=50, help="Exercises the top-k path; set 0 to disable")
     parser.add_argument("--runs", type=int, default=3, help="Timed runs (averaged), after 1 warmup")
+    parser.add_argument("--no-cache", action="store_true",
+                        help="Disable the KV cache (the recompute-everything baseline path)")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out", type=str, default="bench_baseline.json", help="Where to append results")
     args = parser.parse_args()
@@ -112,6 +114,8 @@ def main():
         0, vocab_size, (args.batch_size, args.prompt_len), generator=gen, dtype=torch.long
     ).to(device)
 
+    use_cache = not args.no_cache
+
     def run_once() -> torch.Tensor:
         with torch.no_grad():
             return model.generate(
@@ -120,10 +124,12 @@ def main():
                 temperature=args.temperature,
                 top_k=top_k,
                 eos_token_id=None,  # never stop early -> deterministic token count
+                use_cache=use_cache,
             )
 
     print(f"device={device} dtype={args.dtype} batch={args.batch_size} "
-          f"prompt_len={args.prompt_len} max_tokens={args.max_tokens} top_k={top_k}")
+          f"prompt_len={args.prompt_len} max_tokens={args.max_tokens} top_k={top_k} "
+          f"kv_cache={use_cache}")
     print(f"params={model.get_num_params() / 1e6:.2f}M (non-embedding)")
 
     # Warmup (kernel compile, allocator warm, autotune for Triton/flash).
@@ -154,7 +160,8 @@ def main():
     print(f"peak memory : {f'{peak_mb:,.1f} MB' if peak_mb is not None else 'n/a (cpu)'}")
 
     record = {
-        "label": "baseline-no-kv-cache",
+        "label": "baseline-no-kv-cache" if args.no_cache else "kv-cache",
+        "use_cache": use_cache,
         "device": device,
         "dtype": args.dtype,
         "config": config,
