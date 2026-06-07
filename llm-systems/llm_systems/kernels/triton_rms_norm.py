@@ -244,7 +244,7 @@ class TritonRMSNormFunction(torch.autograd.Function):
 
 class TritonRMSNorm(nn.Module):
     """
-    Triton-fused RMSNorm. Same interface as cs336_basics.model.RMSNorm.
+    Triton-fused RMSNorm. Same interface as llm_core.model.RMSNorm.
 
     Args:
         hidden_size: Dimensionality of the input to normalize.

@@ -189,7 +189,7 @@ class TritonCrossEntropyFunction(torch.autograd.Function):
 def triton_cross_entropy(inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     """Triton-fused cross-entropy loss.
 
-    Same interface as ``cs336_basics.nn_utils.cross_entropy``:
+    Same interface as ``llm_core.nn_functional.cross_entropy``:
         inputs:  (B*T, V)  float logits
         targets: (B*T,)    int64 class indices
     Returns scalar mean loss.

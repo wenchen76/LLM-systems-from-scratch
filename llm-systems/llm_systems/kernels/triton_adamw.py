@@ -32,11 +32,24 @@ import torch
 import triton
 import triton.language as tl
 
+from llm_systems.kernels._autotune import tile_configs
+
 
 # ---------------------------------------------------------------------------
 # Triton kernel — the ENTIRE AdamW update in a single pass
 # ---------------------------------------------------------------------------
 
+# Tile-level autotuning. AdamW is memory-bandwidth-bound and purely elementwise,
+# so the best BLOCK_SIZE / num_warps / num_stages depends on the parameter size;
+# autotune picks per distinct n_elements and caches the winner.
+# restore_value is REQUIRED: this kernel updates param/m/v in place, and autotune
+# re-runs it many times to benchmark — without restoring, the trials corrupt the
+# moments and the chosen config would be tuned on garbage.
+@triton.autotune(
+    configs=tile_configs(block_sizes=(512, 1024, 2048, 4096, 8192)),
+    key=["n_elements"],
+    restore_value=["param_ptr", "exp_avg_ptr", "exp_avg_sq_ptr"],
+)
 @triton.jit
 def _fused_adamw_kernel(
     # --- 4 pointers: the only global memory we touch ---
@@ -102,13 +115,13 @@ def _fused_adamw_kernel(
 
 
 # ---------------------------------------------------------------------------
-# Optimizer class — drop-in replacement for cs336_basics.optimizer.AdamW
+# Optimizer class — drop-in replacement for llm_core.optimizer.AdamW
 # ---------------------------------------------------------------------------
 
 class FusedAdamW(torch.optim.Optimizer):
     """AdamW with a fused Triton kernel.
 
-    Identical interface to cs336_basics.optimizer.AdamW.
+    Identical interface to llm_core.optimizer.AdamW.
     Each call to step() launches ONE kernel per parameter (not 4).
     """
 
@@ -176,16 +189,16 @@ class FusedAdamW(torch.optim.Optimizer):
                 v_flat = state["v"].view(-1)
                 n_elements = param_flat.numel()
 
-                # Launch ONE kernel that does the ENTIRE update
-                BLOCK_SIZE = 1024
-                grid = ((n_elements + BLOCK_SIZE - 1) // BLOCK_SIZE,)
+                # Launch ONE kernel that does the ENTIRE update. BLOCK_SIZE is
+                # chosen by autotune, so the grid reads it from the config meta
+                # and we do NOT pass BLOCK_SIZE explicitly.
+                grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)  # noqa: E731
 
                 _fused_adamw_kernel[grid](
                     param_flat, grad_flat, m_flat, v_flat,
                     lr, beta1, beta2, eps, weight_decay,
                     alpha_t,
                     n_elements,
-                    BLOCK_SIZE=BLOCK_SIZE,
                 )
 
         return loss
