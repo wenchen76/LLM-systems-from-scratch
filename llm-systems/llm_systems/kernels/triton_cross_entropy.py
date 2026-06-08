@@ -11,14 +11,26 @@ import torch
 import triton
 import triton.language as tl
 
+from llm_systems.kernels._autotune import tile_configs
+
 
 MAX_FUSED_SIZE = 65536 // 2
+
+# Tile-level autotuning over the column-tile size and warps/stages. The kernel
+# loops over the vocab in BLOCK_SIZE chunks, so BLOCK_SIZE is a free knob; the
+# best value depends on the vocab size, hence key=["n_cols"]. HAS_GRADIENTS is in
+# the key because the gradient second pass changes the work.
+# restore_value=["X_ptr"] is REQUIRED: the forward writes gradients back into the
+# logits in place, and autotune re-runs the kernel to benchmark — without
+# restoring, the trials would tune on (and corrupt) gradient-filled logits.
+_CE_CONFIGS = tile_configs(block_sizes=(1024, 2048, 4096, 8192, 16384), warps=(8, 16, 32), stages=(1, 2))
 
 
 # ---------------------------------------------------------------------------
 # Triton kernel – one program per row (sample)
 # ---------------------------------------------------------------------------
 
+@triton.autotune(configs=_CE_CONFIGS, key=["n_cols", "HAS_GRADIENTS"], restore_value=["X_ptr"])
 @triton.jit
 def _cross_entropy_fwd_kernel(
     X_ptr,          # [BT, V] logits — overwritten with gradients
@@ -91,7 +103,6 @@ def _cross_entropy_fwd_kernel(
 
 def _cross_entropy_forward(x: torch.Tensor, target: torch.Tensor, ignore_index: int = -100):
     BT, V = x.shape
-    BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(V))
 
     loss_1d = torch.zeros(BT, dtype=x.dtype, device=x.device)
 
@@ -116,9 +127,8 @@ def _cross_entropy_forward(x: torch.Tensor, target: torch.Tensor, ignore_index: 
         n_cols=V,
         n_non_ignore=n_non_ignore,
         ignore_index=ignore_index,
-        BLOCK_SIZE=BLOCK_SIZE,
         HAS_GRADIENTS=x.requires_grad,
-        num_warps=32,
+        # BLOCK_SIZE and num_warps are chosen by @triton.autotune.
     )
 
     loss = loss_1d.sum()
@@ -132,18 +142,19 @@ def _cross_entropy_backward(x: torch.Tensor, grad_output: torch.Tensor):
         return x
     # scalar grad_output (mean/sum reduction)
     BT, V = x.shape
-    BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(V))
     _element_mul_kernel[(BT,)](
         x,
         x.stride(-2),
         grad_output,
         V,
-        BLOCK_SIZE=BLOCK_SIZE,
-        num_warps=32,
+        # BLOCK_SIZE and num_warps are chosen by @triton.autotune.
     )
     return x
 
 
+# Same column-tiling as the forward kernel, and it scales X in place, so it gets
+# the same autotune treatment (restore_value=["X_ptr"]).
+@triton.autotune(configs=_CE_CONFIGS, key=["n_cols"], restore_value=["X_ptr"])
 @triton.jit
 def _element_mul_kernel(
     X_ptr,
