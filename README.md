@@ -71,6 +71,30 @@ for in-tree Triton kernels. The goal isn't to beat every optimized PyTorch
 backend, but to make the tradeoffs explicit: which tensors are read, which
 buffers are written, and where launches or intermediate activations can be cut.
 
+### Fused cross-entropy ([triton_cross_entropy.py](llm-systems/llm_systems/kernels/triton_cross_entropy.py))
+
+Uses online softmax (Milakov & Gimelshein, 2018) to compute logsumexp without
+materializing the full `[B*T, V]` probability matrix. The forward kernel writes
+the mean-reduced gradient in-place into the logits buffer; backward simply
+returns it, scaling by `grad_output` only when needed.
+
+#### Benchmark
+
+Reduced % is the wall-time reduction from Triton relative to the reference or
+Torch fused cross-entropy path. Mem reduced is the activation memory reduction
+relative to the Torch fused path.
+
+| V | triton ms | ref ms | torchF ms | reduced vs ref | reduced vs torchF | triton MB | torchF MB | mem reduced |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 10,000 | 0.650 | 3.017 | 0.831 | 78.5% | 21.8% | 327.8 | 819.2 | 60.0% |
+| 32,000 | 1.576 | 9.173 | 3.350 | 82.8% | 53.0% | 1048.7 | 2621.5 | 60.0% |
+| 50,257 | 2.515 | 14.344 | 5.397 | 82.5% | 53.4% | 1648.4 | 4120.9 | 60.0% |
+| 128,000 | 6.394 | 36.258 | 13.496 | 82.4% | 52.6% | 4194.4 | 10485.8 | 60.0% |
+
+Overall reduced wall-time: 82.3% vs ref, 51.7% vs Torch fused.
+
+Overall reduced memory: 60.0% vs Torch fused.
+
 ### Fused AdamW ([triton_adamw.py](llm-systems/llm_systems/kernels/triton_adamw.py))
 
 Does the entire update — both moments, the parameter step, and decoupled weight
@@ -80,12 +104,19 @@ and `lr` is a runtime scalar so the cosine schedule never triggers
 recompilation. Ships as a `torch.optim.Optimizer` subclass, so it drops into the
 training loop unchanged.
 
-### Fused cross-entropy ([triton_cross_entropy.py](llm-systems/llm_systems/kernels/triton_cross_entropy.py))
+#### Benchmark
 
-Uses online softmax (Milakov & Gimelshein, 2018) to compute logsumexp without
-materializing the full `[B*T, V]` probability matrix. The forward kernel writes
-the mean-reduced gradient in-place into the logits buffer; backward simply
-returns it, scaling by `grad_output` only when needed.
+Reduced % is the wall-time reduction relative to the reference AdamW update.
+
+| N | fused ms | fused GB/s | ref ms | ref GB/s | reduced % |
+|---:|---:|---:|---:|---:|---:|
+| 65,536 | 0.011 | 160.3 | 0.109 | 16.9 | 89.5% |
+| 262,144 | 0.012 | 622.7 | 0.054 | 136.4 | 78.1% |
+| 1,048,576 | 0.026 | 1132.6 | 0.084 | 348.1 | 69.2% |
+| 4,194,304 | 0.078 | 1508.5 | 0.324 | 362.4 | 76.0% |
+| 16,777,216 | 0.278 | 1688.0 | 1.324 | 354.7 | 79.0% |
+
+Overall reduced %: 78.6%
 
 ### Fused RMSNorm ([triton_rms_norm.py](llm-systems/llm_systems/kernels/triton_rms_norm.py))
 
@@ -93,11 +124,45 @@ Forward and backward as row-wise kernels. The reduction runs in fp32 for
 numerical stability, the reciprocal RMS is cached for backward, and partial
 weight gradients accumulate across programs before a final reduction in PyTorch.
 
+#### Benchmark
+
+Reduced % is the wall-time reduction from Triton relative to the reference or
+Torch fused RMSNorm path. Memory reduced compares Triton memory to Torch fused;
+negative values mean Triton used slightly more memory.
+
+| d | triton ms | ref ms | torchF ms | reduced vs ref | reduced vs torchF | triton MB | torchF MB | memory reduced |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1,024 | 0.739 | 1.325 | 0.330 | 44.2% | -123.9% | 269.0 | 268.5 | -0.2% |
+| 2,048 | 0.692 | 2.499 | 0.701 | 72.3% | 1.3% | 537.9 | 537.0 | -0.2% |
+| 4,096 | 0.836 | 4.862 | 1.569 | 82.8% | 46.7% | 1075.7 | 1073.9 | -0.2% |
+| 8,192 | 1.587 | 9.535 | 3.086 | 83.4% | 48.6% | 2151.3 | 2147.8 | -0.2% |
+
+Overall reduced wall-time: 78.9% vs ref, 32.2% vs Torch fused.
+
+Overall reduced memory: -0.2% vs Torch fused.
+
 ### Fused SwiGLU ([triton_swiglu.py](llm-systems/llm_systems/kernels/triton_swiglu.py))
 
 Merges the gate and up projections into one `Linear(d_model, 2 * d_ff)`, then
 fuses `silu(gate) * up` into a custom autograd function. The down projection
 stays a plain linear layer, leaving room for future epilogue fusion.
+
+#### Benchmark
+
+Reduced % is the wall-time reduction from Triton relative to the reference
+SwiGLU path. Memory reduced compares Triton memory to the reference path.
+
+| d_ff | triton ms | ref ms | reduced vs ref | triton MB | ref MB | memory reduced |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1,344 | 0.622 | 0.720 | 13.6% | 528.5 | 616.6 | 14.3% |
+| 2,048 | 0.935 | 1.081 | 13.5% | 805.3 | 939.5 | 14.3% |
+| 4,096 | 1.842 | 2.127 | 13.4% | 1610.6 | 1879.0 | 14.3% |
+| 8,192 | 3.673 | 4.223 | 13.0% | 3221.2 | 3758.1 | 14.3% |
+| 11,008 | 4.939 | 5.663 | 12.8% | 4328.5 | 5049.9 | 14.3% |
+
+Overall reduced wall-time: 13.1% vs ref.
+
+Overall reduced memory: 14.3% vs ref.
 
 ## Custom DDP (`--parallel ddp`)
 
