@@ -13,6 +13,15 @@ import triton
 import triton.language as tl
 
 from llm_core.model import Linear
+from llm_systems.kernels._autotune import warp_configs
+
+
+# One row per program with BLOCK_SIZE pinned to next_pow2(n_cols), so the tile
+# shape is fixed and only num_warps / num_stages are tuned, keyed on n_cols.
+# The forward writes a fresh out buffer (no restore_value); the backward reads
+# and then overwrites gate/up with gradients in place, so it needs
+# restore_value=["gate_ptr","up_ptr"] for autotune's trial reruns.
+_SWIGLU_CONFIGS = warp_configs(warps=(2, 4, 8, 16, 32))
 
 
 # ---------------------------------------------------------------------------
@@ -24,6 +33,7 @@ def _silu(x):
     return x * tl.sigmoid(x)
 
 
+@triton.autotune(configs=_SWIGLU_CONFIGS, key=["n_cols"])
 @triton.jit
 def _silu_mul_fwd_kernel(
     gate_ptr, up_ptr, out_ptr,
@@ -47,6 +57,7 @@ def _silu_mul_fwd_kernel(
     tl.store(out_ptr + col_offsets, out_row, mask=mask)
 
 
+@triton.autotune(configs=_SWIGLU_CONFIGS, key=["n_cols"], restore_value=["gate_ptr", "up_ptr"])
 @triton.jit
 def _silu_mul_bwd_kernel(
     dout_ptr, gate_ptr, up_ptr,
