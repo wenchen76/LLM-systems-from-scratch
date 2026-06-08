@@ -64,6 +64,33 @@ Every system feature is a CLI flag — turn one on at a time to isolate its effe
 | `--world-size N` | Number of GPUs for distributed training |
 | `--config path` | Path to YAML config (default `configures/sample.yaml`) |
 
+## Training benchmark ([bench_train.py](bench_train.py))
+
+Usage:
+
+```bash
+uv run python bench_train.py --config configures/gpt3xl.yaml --amp --compile-baseline --batches 1 2 4 8 16 --warmup 10 --iters 100
+```
+
+End-to-end GPT-3 XL training-step benchmark using
+[`configures/gpt3xl.yaml`](configures/gpt3xl.yaml).
+
+Reduced % is the wall-time reduction from Triton relative to the baseline or
+compiled baseline. Memory reduced compares Triton memory to the baseline.
+
+| batch | baseline ms | baseline GB | compiled ms | compiled GB | triton ms | triton GB | reduced vs baseline | reduced vs compiled | memory reduced |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 314.0 | 28.02 | 268.0 | 25.43 | 198.9 | 24.94 | 36.7% | 25.8% | 11.0% |
+| 2 | 458.8 | 36.08 | 367.3 | 30.95 | 318.1 | 29.43 | 30.7% | 13.4% | 18.5% |
+| 4 | 727.3 | 52.08 | 559.0 | 41.96 | 551.3 | 38.35 | 24.2% | 1.4% | 26.4% |
+| 8 | OOM | - | 958.7 | 64.06 | 1020.1 | 56.26 | - | -6.4% | - |
+| 16 | OOM | - | OOM | - | OOM | - | - | - | - |
+
+Overall reduced wall-time: 28.8% vs baseline on non-OOM baseline batches, 3.0%
+vs compiled on non-OOM compiled batches.
+
+Overall reduced memory: 20.2% vs baseline on non-OOM baseline batches.
+
 ## Custom Triton kernels (`--custom-triton`)
 
 `--custom-triton` swaps the memory-bandwidth-bound pieces of the training step

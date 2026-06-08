@@ -87,6 +87,7 @@ def bench_setting(setting, cfg, batches, amp, device, warmup, iters, compile_mod
                 run_step(model, opt, ce, x, y, amp, device)
                 print(f"  [{setting} b={b}] warmup {w + 1}/{warmup}  mem {torch.cuda.memory_allocated() / 1e9:.1f} GB")
             torch.cuda.synchronize()
+            
             torch.cuda.reset_peak_memory_stats()
             t0 = time.time()
             for it in range(iters):
