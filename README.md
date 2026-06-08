@@ -75,6 +75,9 @@ uv run python bench_train.py --config configures/gpt3xl.yaml --amp --compile-bas
 End-to-end GPT-3 XL training-step benchmark using
 [`configures/gpt3xl.yaml`](configures/gpt3xl.yaml).
 
+Benchmark settings: NVIDIA A100-SXM4-80GB, FlashAttention enabled, BF16 AMP
+enabled with `--amp`, and compiled baseline enabled with `--compile-baseline`.
+
 Reduced % is the wall-time reduction from Triton relative to the baseline or
 compiled baseline. Memory reduced compares Triton memory to the baseline.
 
