@@ -16,17 +16,27 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
+from llm_systems.kernels._autotune import warp_configs
+
 TORCH_TO_TRITON_DTYPE = {
     torch.float32: tl.float32,
     torch.float16: tl.float16,
     torch.bfloat16: tl.bfloat16,
 }
 
+# Both kernels process one row per program with BLOCK_SIZE pinned to
+# next_pow2(n_cols) by the caller, so the tile shape is not a free knob — only
+# num_warps / num_stages are tuned (num_warps matters a lot for wide rows).
+# No restore_value: forward writes Y/RSTD and backward writes dX/dW_partial, all
+# fresh outputs, so autotune's repeated trial runs are side-effect free.
+_RMS_CONFIGS = warp_configs(warps=(2, 4, 8, 16, 32))
+
 
 # ---------------------------------------------------------------------------
 # Forward kernel
 # ---------------------------------------------------------------------------
 
+@triton.autotune(configs=_RMS_CONFIGS, key=["n_cols"])
 @triton.jit
 def _rms_norm_forward_kernel(
     Y_ptr,
@@ -78,6 +88,7 @@ def _rms_norm_forward_kernel(
 # Backward kernel
 # ---------------------------------------------------------------------------
 
+@triton.autotune(configs=_RMS_CONFIGS, key=["n_cols"])
 @triton.jit
 def _rms_norm_backward_kernel(
     dY_ptr,
