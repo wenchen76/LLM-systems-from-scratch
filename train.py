@@ -111,7 +111,7 @@ def train_worker(
     if use_distributed:
         os.environ.setdefault("MASTER_ADDR", "localhost")
         os.environ.setdefault("MASTER_PORT", "29500")
-ㄐ        dist.init_process_group("nccl", rank=rank, world_size=world_size)
+        dist.init_process_group("nccl", rank=rank, world_size=world_size)
         local_rank = rank % torch.cuda.device_count()
         torch.cuda.set_device(local_rank)
         device = f"cuda:{local_rank}"

@@ -1,0 +1,30 @@
+model:
+  vocab_size: 50257
+  context_length: 2048    # GPT-3 uses n_ctx=2048
+  d_model: 2048
+  num_layers: 24
+  num_heads: 16           # GPT-3 XL table lists 24, but 2048 % 24 != 0; 16 heads -> d_head=128
+  d_ff: 5504              # ~= 8/3 * d_model: SwiGLU (3 matrices) param-parity with GPT-3's 4*d_model MLP (~1.3B total)
+  rope_theta: 10000.0
+
+training:
+  device: "auto"
+  batch_size: 4           # ctx is 2048 here, so memory per sample doubles vs GPT-2; tune to your GPU
+  max_steps: 500          # benchmark scale; real training needs ~20k-60k at GPT-3 XL's ~1M-token batch
+  val_interval: 50
+  gpu_log_interval: 10
+  checkpoint_dir: "checkpoints/gpt3xl"
+  wandb: false
+  wandb_project: "gpt3xl-owt"
+
+optimizer:
+  learning_rate_max: 2.0e-4    # GPT-3 XL: 2.0e-4
+  learning_rate_min: 2.0e-5
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  warmup_steps: 2000
+  decay_steps: 300000
+
+dataset:
+  train_path: "data/owt_train.bin"
+  val_path: "data/owt_val.bin"
