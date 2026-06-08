@@ -78,17 +78,20 @@ def bench_setting(setting, cfg, batches, amp, device, warmup, iters, compile_mod
     for b in batches:
         if oom:  # once a batch OOMs, all larger ones will too
             results[b] = "OOM"
+            print(f"  [{setting} b={b}] skipped (a smaller batch already OOM'd)")
             continue
         try:
             x = torch.randint(0, vocab, (b, ctx), device=device)
             y = torch.randint(0, vocab, (b, ctx), device=device)
-            for _ in range(warmup):  # warm allocator + Triton autotune, allocate optimizer state
+            for w in range(warmup):  # warm allocator + Triton autotune, allocate optimizer state
                 run_step(model, opt, ce, x, y, amp, device)
+                print(f"  [{setting} b={b}] warmup {w + 1}/{warmup}  mem {torch.cuda.memory_allocated() / 1e9:.1f} GB")
             torch.cuda.synchronize()
             torch.cuda.reset_peak_memory_stats()
             t0 = time.time()
-            for _ in range(iters):
+            for it in range(iters):
                 run_step(model, opt, ce, x, y, amp, device)
+                print(f"  [{setting} b={b}] step {it + 1}/{iters}  mem {torch.cuda.memory_allocated() / 1e9:.1f} GB")
             torch.cuda.synchronize()
             ms = (time.time() - t0) / iters * 1e3
             gb = torch.cuda.max_memory_allocated() / 1e9
@@ -97,6 +100,7 @@ def bench_setting(setting, cfg, batches, amp, device, warmup, iters, compile_mod
         except torch.cuda.OutOfMemoryError:
             results[b] = "OOM"
             oom = True
+            print(f"  [{setting} b={b}] OOM")
             torch.cuda.empty_cache()
     del model, opt
     torch.cuda.empty_cache()
