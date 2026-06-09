@@ -53,6 +53,8 @@ def main():
                         help="Top-k sampling")
     parser.add_argument("--device", type=str, default="auto",
                         help="Device to use (auto, cpu, cuda)")
+    parser.add_argument("--no-flash-attn", action="store_true",
+                        help="Disable FlashAttention (PyTorch SDPA); enabled by default")
     args = parser.parse_args()
 
     if args.device == "auto":
@@ -65,6 +67,13 @@ def main():
         checkpoint_path=args.checkpoint,
     ).to(device)
     model.eval()
+
+    # FlashAttention (PyTorch SDPA) on by default: faster and lower-memory for
+    # both prefill and cached decode, with identical results. --no-flash-attn opts out.
+    use_flash_attn = not args.no_flash_attn
+    for module in model.modules():
+        if hasattr(module, "use_flash_attn"):
+            module.use_flash_attn = use_flash_attn
 
     tokenizer = Tokenizer.from_files(args.vocab, args.merges, special_tokens=["<|endoftext|>"])
     eos_token_id = tokenizer.encode("<|endoftext|>")[0] if "<|endoftext|>" in tokenizer.special_tokens else None

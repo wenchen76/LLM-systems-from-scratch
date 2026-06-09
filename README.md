@@ -295,6 +295,10 @@ python train.py --parallel fsdp --world-size 4 --amp --flash-attn
 
 ### Generate
 
+`generate.py` loads a checkpoint into the continuous-batching engine. It enables
+FlashAttention (PyTorch SDPA) by default for prefill and cached decode; pass
+`--no-flash-attn` to fall back to the reference attention path.
+
 ```bash
 python generate.py \
   --config checkpoints/sample/model_config.json \
@@ -303,11 +307,13 @@ python generate.py \
   --max-tokens 200 --temperature 0.8 --top-k 40
 ```
 
-You'll get an interactive prompt. `Ctrl+C` to exit.
+Enter one prompt per line, then submit the batch with a blank line. Prompts in
+the same batch generate concurrently; use `Ctrl+C` or `Ctrl+D` to exit.
 
 ## Roadmap
 
 - Persistent `flat_full` buffer in `FSDPUnit` so `--parallel fsdp` + `--compile` work together
 - Tensor / pipeline parallelism
+- Gradient accumulation
 - Activation checkpointing
-- KV-cache and continuous batching for `generate.py`
+- Prefill-Decode Disaggregation
