@@ -1,6 +1,6 @@
 # LLM Systems from Scratch
 
-A decoder-only Transformer language model built from scratch — plus the systems infrastructure that trains it efficiently: custom Triton kernels, custom FSDP (ZeRO-3) and DDP wrappers, a BPE tokenizer, and a training loop wired up with mixed precision, `torch.compile`, FlashAttention, and Weights & Biases.
+An autoregressive Transformer language model built from scratch — plus the systems infrastructure that trains and serves it efficiently: custom Triton kernels, custom FSDP (ZeRO-3) and DDP wrappers, continuous batching, a BPE tokenizer, and a training loop wired up with mixed precision, `torch.compile`, FlashAttention, and Weights & Biases.
 
 Every layer is reimplemented, so the interactions between modeling code, autograd, CUDA streams, NCCL collectives, and Triton kernels stay visible and modifiable.
 
@@ -22,18 +22,22 @@ usually hide behind their APIs:
 - **Distributed systems** — custom DDP overlaps bucketed all-reduce with
   backprop; custom FSDP/ZeRO-3 shards parameters, gradients, and optimizer state
   with explicit all-gather / reduce-scatter scheduling.
+- **Inference serving** — a continuous-batching engine with per-request KV
+  caches, iteration-level scheduling, and selective (variable-length) batching
+  that mixes prefill and decode in a single forward.
 
 ## Repository layout
 
 ```
 LLM-systems-from-scratch/
 ├── train.py                     # Training entry-point (flags toggle every system feature)
-├── generate.py                  # Interactive REPL for sampling from a checkpoint
+├── generate.py                  # Interactive continuous-batching demo (concurrent prompts)
 ├── configures/sample.yaml       # Model / optimizer / data config
 ├── tokenizer/BPETokenizer.py    # Byte-pair encoding tokenizer (train + encode/decode)
 ├── llm-core/                    # Modeling code — pure PyTorch reference implementation
 │   └── llm_core/
-│       ├── model.py             # TransformerLM: RoPE, RMSNorm, SwiGLU, causal MHA
+│       ├── model.py             # TransformerLM: RoPE, RMSNorm, SwiGLU, causal MHA, KV cache, varlen forward
+│       ├── engine.py            # Continuous-batching inference engine (iteration-level scheduler)
 │       ├── optimizer.py         # AdamW + cosine LR schedule with warmup
 │       ├── nn_functional.py     # softmax, cross-entropy, gradient clipping
 │       └── dataloader.py        # memmap-backed batch sampler with pinned-memory copy
@@ -230,6 +234,27 @@ Backward: lm_head.bw → final_norm.bw → EndHook.bw → layer_N.bw → Hook_N.
 **Checkpointing under FSDP.** At save time, every unit does a synchronous all-gather, rank 0 writes the full state dict, then each unit discards the unsharded buffer.
 
 **Known limitation.** `--parallel fsdp` + `--compile` is explicitly blocked: the FSDP unit swaps `param.data` on every forward, invalidating `torch.compile`'s dynamo guards. Fixing this requires a persistent `flat_full` buffer per unit so param `data_ptr` stays stable.
+
+## Continuous batching ([engine.py](llm-core/llm_core/engine.py))
+
+An iteration-level inference scheduler (Orca / vLLM style) built on the model's
+KV cache and variable-length forward path. Static batching makes a whole batch
+wait for its longest sequence; continuous batching schedules at the granularity
+of a single decode step, so a finished request frees its slot immediately and a
+queued request joins mid-flight — keeping the batch full instead of draining
+between waves.
+
+- `Request` tracks prompt tokens, generated tokens, per-layer `KVCache`, and
+  `SamplingParams`.
+- `TransformerLM.forward_varlen` packs mixed prefill and decode tokens into one
+  ragged batch with `cu_seqlens`, avoiding padding while each sequence attends
+  over its own cache.
+- `LLMEngine.step()` admits requests, runs one mixed forward pass, samples one
+  token per active request, and retires completed requests.
+
+`add_request()` / `step()` are the public API. [generate.py](generate.py) is an
+interactive demo for concurrent prompts, and [bench_engine.py](bench_engine.py)
+compares continuous vs static admission on the same engine and kernels.
 
 ## Quickstart
 
