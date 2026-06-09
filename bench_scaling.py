@@ -79,16 +79,27 @@ def worker(rank, world_size, mode, model_cfg, optim_cfg, local_batch, amp, flash
     x = torch.randint(0, vocab, (local_batch, ctx), device=device)
     y = torch.randint(0, vocab, (local_batch, ctx), device=device)
 
+    first = [True]
+
     def step():
         model.zero_grad()
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=amp):
             logits = model(x)
             loss = cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
+        if first[0]:
+            log("  forward done")
         loss.backward()
+        if first[0]:
+            log("  backward done")
         if distributed:
             model.finish_gradient_synchronization()
+            if first[0]:
+                log("  grad sync done")
         clip_gradient(model.parameters(), max_grad_norm)
         opt.step()
+        if first[0]:
+            log("  optimizer step done")
+            first[0] = False
 
     log("starting warmup step 1...")
     for w in range(warmup):  # NCCL/alloc warmup, optimizer-state allocation
