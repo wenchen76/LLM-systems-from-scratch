@@ -22,6 +22,7 @@ CUDA + NCCL, multi-GPU node.
 import argparse
 import json
 import os
+import socket
 import tempfile
 import time
 
@@ -39,8 +40,7 @@ def worker(rank, world_size, mode, model_cfg, optim_cfg, local_batch, amp, flash
     log = lambda msg: print(f"  [rank {rank}/{world_size}] {msg}", flush=True)  # noqa: E731
     distributed = world_size > 1
     if distributed:
-        os.environ.setdefault("MASTER_ADDR", "localhost")
-        os.environ.setdefault("MASTER_PORT", "29500")
+        # MASTER_ADDR / MASTER_PORT are set by the parent (a fresh free port per run).
         log("init_process_group (NCCL)...")
         dist.init_process_group("nccl", rank=rank, world_size=world_size)
         local_rank = rank % torch.cuda.device_count()
@@ -130,8 +130,19 @@ def worker(rank, world_size, mode, model_cfg, optim_cfg, local_batch, amp, flash
         dist.destroy_process_group()
 
 
+def find_free_port():
+    """Grab an OS-assigned free port so sequential runs never collide on a stale one."""
+    s = socket.socket()
+    s.bind(("", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
 def run_n(n, args, model_cfg, optim_cfg):
     """Spawn n workers (always via mp.spawn so each run is an isolated process)."""
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = str(find_free_port())  # fresh port each run; children inherit it
     with tempfile.NamedTemporaryFile("r", suffix=".json", delete=False) as tf:
         result_path = tf.name
     mp.spawn(
