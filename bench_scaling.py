@@ -36,16 +36,19 @@ from llm_core.optimizer import AdamW
 
 
 def worker(rank, world_size, mode, model_cfg, optim_cfg, local_batch, amp, flash, warmup, iters, result_path):
+    log = lambda msg: print(f"  [rank {rank}/{world_size}] {msg}", flush=True)  # noqa: E731
     distributed = world_size > 1
     if distributed:
         os.environ.setdefault("MASTER_ADDR", "localhost")
         os.environ.setdefault("MASTER_PORT", "29500")
+        log("init_process_group (NCCL)...")
         dist.init_process_group("nccl", rank=rank, world_size=world_size)
         local_rank = rank % torch.cuda.device_count()
     else:
         local_rank = 0
     torch.cuda.set_device(local_rank)
     device = f"cuda:{local_rank}"
+    log(f"process group ready on {device}")
 
     ctx, vocab = model_cfg["context_length"], model_cfg["vocab_size"]
     model = TransformerLM(
@@ -59,12 +62,15 @@ def worker(rank, world_size, mode, model_cfg, optim_cfg, local_batch, amp, flash
         use_flash_attn=flash,
     ).to(device)
     model.train()
+    log("model built")
     if distributed and mode == "ddp":
         from llm_systems.parallelism.ddp import DDP
-        model = DDP(model)
+        model = DDP(model)  # rank-0 broadcast of weights happens here
     elif distributed and mode == "fsdp":
         from llm_systems.parallelism.fsdp_zero3 import FSDP
         model = FSDP(model)
+    if distributed:
+        log(f"{mode} wrapper ready")
 
     opt = AdamW(model.parameters(), lr=float(optim_cfg["learning_rate_max"]),
                 weight_decay=float(optim_cfg["weight_decay"]))
@@ -84,10 +90,14 @@ def worker(rank, world_size, mode, model_cfg, optim_cfg, local_batch, amp, flash
         clip_gradient(model.parameters(), max_grad_norm)
         opt.step()
 
-    for _ in range(warmup):  # NCCL/alloc warmup, optimizer-state allocation
+    log("starting warmup step 1...")
+    for w in range(warmup):  # NCCL/alloc warmup, optimizer-state allocation
         step()
+        if w == 0:
+            log("warmup step 1 done")
     if distributed:
         dist.barrier()
+    log("warmup done, timing...")
     torch.cuda.synchronize()
     t0 = time.time()
     for _ in range(iters):
