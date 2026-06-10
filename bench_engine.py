@@ -59,23 +59,29 @@ def total_tokens(requests):
     return sum(sp.max_tokens for _, sp in requests)
 
 
-def run_continuous(model, requests, batch, device, trace=None):
+def _log(label, steps, engine, done, total, log_every):
+    if log_every and steps % log_every == 0:
+        print(f"  [{label}] step {steps:4d}  running={len(engine.running):3d}  done={done}/{total}", flush=True)
+
+
+def run_continuous(model, requests, batch, device, trace=None, label="continuous", log_every=0):
     engine = LLMEngine(model, device=device, max_running=batch)
     for prompt, sp in requests:
         engine.add_request(prompt, sp)
-    steps = 0
+    steps = done = 0
     while engine.has_work():
         if trace is not None:
             trace.append(len(engine.running))
-        engine.step()
+        done += len(engine.step())
         steps += 1
+        _log(label, steps, engine, done, len(requests), log_every)
     return steps
 
 
-def run_static(model, requests, batch, device, trace=None):
+def run_static(model, requests, batch, device, trace=None, label="static", log_every=0):
     """Admit in fixed waves; the next wave waits until the current one fully drains."""
     engine = LLMEngine(model, device=device, max_running=batch)
-    i, steps = 0, 0
+    i, steps, done = 0, 0, 0
     while i < len(requests) or engine.running:
         if not engine.running:  # current wave drained -> admit the next
             for prompt, sp in requests[i : i + batch]:
@@ -83,8 +89,9 @@ def run_static(model, requests, batch, device, trace=None):
             i += batch
         if trace is not None:
             trace.append(len(engine.running))
-        engine.step()
+        done += len(engine.step())
         steps += 1
+        _log(label, steps, engine, done, len(requests), log_every)
     return steps
 
 
@@ -130,10 +137,15 @@ def main():
           f"max={max(sp.max_tokens for _, sp in requests)}")
 
     # Warm up kernels / allocator.
+    print("warming up...", flush=True)
     time_run(lambda: run_continuous(model, requests[:args.batch], args.batch, args.device), args.device)
 
-    static_t, static_steps = time_run(lambda: run_static(model, requests, args.batch, args.device), args.device)
-    cont_t, cont_steps = time_run(lambda: run_continuous(model, requests, args.batch, args.device), args.device)
+    print("running static batching...", flush=True)
+    static_t, static_steps = time_run(
+        lambda: run_static(model, requests, args.batch, args.device, label="static", log_every=20), args.device)
+    print("running continuous batching...", flush=True)
+    cont_t, cont_steps = time_run(
+        lambda: run_continuous(model, requests, args.batch, args.device, label="continuous", log_every=20), args.device)
 
     print("-" * 60)
     print(f"static batching     : {static_t:6.2f}s  {static_steps:4d} steps  {tokens / static_t:8.1f} tok/s")
