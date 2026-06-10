@@ -13,11 +13,13 @@ independent of weights, so we use a random-init model and random prompts.
 
     python bench_engine.py
     python bench_engine.py --requests 64 --batch 8 --device cpu
+    python bench_engine.py --config configures/gpt3xl.yaml --device cuda --dtype bfloat16
 """
 import argparse
 import time
 
 import torch
+import yaml
 
 from llm_core.engine import LLMEngine, SamplingParams
 from llm_core.model import TransformerLM
@@ -31,6 +33,14 @@ DEFAULT_CONFIG = {
     "d_ff": 2048,
     "rope_theta": 10000.0,
 }
+
+
+def load_model_config(path):
+    """Model dims from a training YAML's `model` section, or the built-in default."""
+    if path is None:
+        return dict(DEFAULT_CONFIG)
+    with open(path) as f:
+        return yaml.safe_load(f)["model"]
 
 
 def make_requests(n, vocab_size, seed=0):
@@ -99,18 +109,23 @@ def main():
     parser.add_argument("--requests", type=int, default=48)
     parser.add_argument("--batch", type=int, default=8, help="Max concurrent requests (slots)")
     parser.add_argument("--device", type=str, default="cpu", help="cpu, cuda, mps")
+    parser.add_argument("--config", type=str, default=None,
+                        help="Training YAML for model dims (e.g. configures/gpt3xl.yaml); default: small built-in")
+    parser.add_argument("--dtype", type=str, default="float32", choices=["float32", "float16", "bfloat16"])
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--trace", action="store_true",
                         help="Print per-step batch occupancy (slot utilization) for both policies")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
-    model = TransformerLM(**DEFAULT_CONFIG).to(args.device).eval()
-    requests = make_requests(args.requests, DEFAULT_CONFIG["vocab_size"], seed=args.seed)
+    model_cfg = load_model_config(args.config)
+    dtype = getattr(torch, args.dtype)
+    model = TransformerLM(**model_cfg, use_flash_attn=True).to(device=args.device, dtype=dtype).eval()
+    requests = make_requests(args.requests, model_cfg["vocab_size"], seed=args.seed)
     tokens = total_tokens(requests)
 
-    print(f"device={args.device} requests={args.requests} slots={args.batch} "
-          f"tokens_to_generate={tokens}")
+    print(f"device={args.device} dtype={args.dtype} d_model={model_cfg['d_model']} layers={model_cfg['num_layers']} "
+          f"requests={args.requests} slots={args.batch} tokens_to_generate={tokens}")
     print(f"output lengths: min={min(sp.max_tokens for _, sp in requests)} "
           f"max={max(sp.max_tokens for _, sp in requests)}")
 
