@@ -209,6 +209,31 @@ bucketing, async all-reduce, and explicit sync before the optimizer step.
 - Gradients accumulate into fixed-size buckets (default 25 MB); when one fills, a `post_accumulate_grad_hook` flattens it and launches an async `all_reduce`.
 - `finish_gradient_synchronization()` joins all in-flight handles and unflattens the averaged grads back into `param.grad`.
 
+#### Benchmark
+
+Environment: 8x A100 SXM4 80GB, GPT-3 XL config
+([configures/gpt3xl.yaml](configures/gpt3xl.yaml)).
+
+Efficiency is `TPS(N) / (N * TPS(1))`, using the 1-GPU run as the baseline.
+
+**DDP Eager**
+
+| GPUs | global batch | step ms | global tok/s | efficiency | peak GB |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 4 | 743.4 | 11,020 | 100.0% | 51.95 |
+| 2 | 8 | 773.0 | 21,194 | 96.2% | 51.93 |
+| 4 | 16 | 781.7 | 41,919 | 95.1% | 51.93 |
+| 8 | 32 | 789.6 | 82,995 | 94.1% | 51.93 |
+
+**DDP Triton**
+
+| GPUs | global batch | step ms | global tok/s | efficiency | peak GB |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 4 | 564.2 | 14,520 | 100.0% | 38.30 |
+| 2 | 8 | 593.7 | 27,596 | 95.0% | 38.30 |
+| 4 | 16 | 599.5 | 54,662 | 94.1% | 38.30 |
+| 8 | 32 | 605.7 | 108,192 | 93.1% | 38.30 |
+
 ## Custom FSDP / ZeRO-3 (`--parallel fsdp`)
 
 [`fsdp_zero3.py`](llm-systems/llm_systems/parallelism/fsdp_zero3.py) is the most involved piece: full sharding of **parameters, gradients, and optimizer state**, with eager prefetching and a dedicated CUDA stream for collectives.
@@ -234,6 +259,31 @@ Backward: lm_head.bw → final_norm.bw → EndHook.bw → layer_N.bw → Hook_N.
 **Checkpointing under FSDP.** At save time, every unit does a synchronous all-gather, rank 0 writes the full state dict, then each unit discards the unsharded buffer.
 
 **Known limitation.** `--parallel fsdp` + `--compile` is explicitly blocked: the FSDP unit swaps `param.data` on every forward, invalidating `torch.compile`'s dynamo guards. Fixing this requires a persistent `flat_full` buffer per unit so param `data_ptr` stays stable.
+
+#### Benchmark
+
+Environment: 8x A100 SXM4 80GB, GPT-3 XL config
+([configures/gpt3xl.yaml](configures/gpt3xl.yaml)).
+
+Efficiency is `TPS(N) / (N * TPS(1))`, using the 1-GPU run as the baseline.
+
+**FSDP Eager**
+
+| GPUs | global batch | step ms | global tok/s | efficiency | peak GB |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 4 | 744.1 | 11,009 | 100.0% | 51.95 |
+| 2 | 8 | 734.4 | 22,308 | 101.3% | 51.88 |
+| 4 | 16 | 709.5 | 46,184 | 104.9% | 46.21 |
+| 8 | 32 | 697.8 | 93,918 | 106.6% | 43.36 |
+
+**FSDP Triton**
+
+| GPUs | global batch | step ms | global tok/s | efficiency | peak GB |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 4 | 565.0 | 14,498 | 100.0% | 38.30 |
+| 2 | 8 | 602.9 | 27,176 | 93.7% | 38.49 |
+| 4 | 16 | 600.0 | 54,613 | 94.2% | 32.80 |
+| 8 | 32 | 598.3 | 109,537 | 94.4% | 29.94 |
 
 ## Continuous batching ([engine.py](llm-core/llm_core/engine.py))
 
