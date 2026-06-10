@@ -36,7 +36,7 @@ from llm_core.nn_functional import clip_gradient, cross_entropy
 from llm_core.optimizer import AdamW
 
 
-def worker(rank, world_size, mode, model_cfg, optim_cfg, local_batch, amp, flash, warmup, iters, result_path):
+def worker(rank, world_size, mode, model_cfg, optim_cfg, local_batch, amp, flash, custom_triton, warmup, iters, result_path):
     log = lambda msg: print(f"  [rank {rank}/{world_size}] {msg}", flush=True)  # noqa: E731
     distributed = world_size > 1
     if distributed:
@@ -60,6 +60,7 @@ def worker(rank, world_size, mode, model_cfg, optim_cfg, local_batch, amp, flash
         d_ff=model_cfg["d_ff"],
         rope_theta=model_cfg["rope_theta"],
         use_flash_attn=flash,
+        use_custom_triton=custom_triton,   # Triton RMSNorm / SwiGLU
     ).to(device)
     model.train()
     log("model built")
@@ -72,8 +73,14 @@ def worker(rank, world_size, mode, model_cfg, optim_cfg, local_batch, amp, flash
     if distributed:
         log(f"{mode} wrapper ready")
 
-    opt = AdamW(model.parameters(), lr=float(optim_cfg["learning_rate_max"]),
-                weight_decay=float(optim_cfg["weight_decay"]))
+    if custom_triton:
+        from llm_systems.kernels.triton_adamw import FusedAdamW
+        from llm_systems.kernels.triton_cross_entropy import triton_cross_entropy
+        OptimizerClass, ce = FusedAdamW, triton_cross_entropy
+    else:
+        OptimizerClass, ce = AdamW, cross_entropy
+    opt = OptimizerClass(model.parameters(), lr=float(optim_cfg["learning_rate_max"]),
+                         weight_decay=float(optim_cfg["weight_decay"]))
     max_grad_norm = float(optim_cfg["max_grad_norm"])
 
     x = torch.randint(0, vocab, (local_batch, ctx), device=device)
@@ -85,7 +92,7 @@ def worker(rank, world_size, mode, model_cfg, optim_cfg, local_batch, amp, flash
         model.zero_grad()
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=amp):
             logits = model(x)
-            loss = cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
+            loss = ce(logits.view(-1, logits.size(-1)), y.view(-1))
         if first[0]:
             log("  forward done")
         loss.backward()
@@ -148,7 +155,7 @@ def run_n(n, args, model_cfg, optim_cfg):
     mp.spawn(
         worker,
         args=(n, args.mode, model_cfg, optim_cfg, args.local_batch,
-              args.amp, args.flash_attn, args.warmup, args.iters, result_path),
+              args.amp, args.flash_attn, args.custom_triton, args.warmup, args.iters, result_path),
         nprocs=n,
         join=True,
     )
@@ -166,6 +173,8 @@ def main():
     parser.add_argument("--config", default="configures/gpt3xl.yaml")
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--flash-attn", action="store_true")
+    parser.add_argument("--custom-triton", action="store_true",
+                        help="Use custom Triton kernels (FusedAdamW + fused cross-entropy + RMSNorm/SwiGLU)")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=30)
     args = parser.parse_args()
@@ -180,6 +189,7 @@ def main():
         cfg = yaml.safe_load(f)
     model_cfg, optim_cfg = cfg["model"], cfg["optimizer"]
     print(f"mode={args.mode} local_batch={args.local_batch} amp={args.amp} flash={args.flash_attn} "
+          f"custom_triton={args.custom_triton} "
           f"model: d_model={model_cfg['d_model']} layers={model_cfg['num_layers']} ctx={model_cfg['context_length']}")
 
     results = {}
