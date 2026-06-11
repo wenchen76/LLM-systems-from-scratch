@@ -2,7 +2,7 @@
 import pytest
 import torch
 
-from llm_core.paged_kv import BlockPool
+from llm_core.paged_kv import BlockPool, PagedKVCache
 
 
 def make_pool(num_blocks=8, block_size=4, num_heads=2, d_head=16):
@@ -47,3 +47,39 @@ def test_exhaustion_raises():
 def test_blocks_needed(n_tokens, expected):
     pool = make_pool(block_size=4)
     assert pool.blocks_needed(n_tokens) == expected
+
+
+def test_paged_cache_matches_contiguous_reference():
+    """append + materialize over a mix of prefill (chunk) and decode (1-token)
+    steps, including block-boundary crossings, must equal a plain concatenation."""
+    torch.manual_seed(0)
+    heads, d, block_size = 2, 16, 4
+    pool = BlockPool(num_blocks=16, block_size=block_size, num_heads=heads, d_head=d)
+    cache = PagedKVCache(pool)
+
+    ref_k, ref_v = [], []
+    for n_new in [5, 1, 1, 1, 3, 1]:  # prefill 5, then decodes, crossing 4-token blocks
+        k = torch.randn(heads, n_new, d)
+        v = torch.randn(heads, n_new, d)
+        cache.append(k, v)
+        ref_k.append(k)
+        ref_v.append(v)
+
+    length = 12
+    assert cache.length == length
+    assert len(cache.block_table) == pool.blocks_needed(length) == 3  # cdiv(12, 4)
+
+    mk, mv = cache.materialize()
+    assert mk.shape == (heads, length, d)
+    assert torch.allclose(mk, torch.cat(ref_k, dim=1))
+    assert torch.allclose(mv, torch.cat(ref_v, dim=1))
+
+
+def test_paged_cache_free_returns_blocks():
+    pool = make_pool(num_blocks=8, block_size=4)
+    cache = PagedKVCache(pool)
+    cache.append(torch.randn(2, 9, 16), torch.randn(2, 9, 16))  # 9 tokens -> 3 blocks
+    assert pool.num_free == 5
+    cache.free()
+    assert pool.num_free == 8
+    assert cache.length == 0 and cache.block_table == []

@@ -57,3 +57,52 @@ class BlockPool:
     def free(self, block_ids: list[int]) -> None:
         """Return blocks to the pool (e.g. when a request finishes)."""
         self._free.extend(block_ids)
+
+
+class PagedKVCache:
+    """One request's KV cache, stored as a block table into a shared BlockPool.
+
+    Mirrors KVCache's role (length / append) but writes tokens into pool blocks,
+    growing one block at a time. materialize() gathers the cached tokens back
+    into a contiguous (heads, length, d_head) view for eager attention and tests;
+    the paged attention kernel will instead read the pool via the block table.
+    """
+
+    def __init__(self, pool: BlockPool):
+        self.pool = pool
+        self.block_table: list[int] = []
+        self.length = 0
+
+    def _physical(self, positions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Map absolute token positions to (physical block id, in-block offset)."""
+        table = torch.tensor(self.block_table, device=self.pool.k.device)
+        block_idx = positions // self.pool.block_size
+        return table[block_idx], positions % self.pool.block_size
+
+    def append(self, k: torch.Tensor, v: torch.Tensor) -> None:
+        """Append new tokens. k, v: (heads, n_new, d_head)."""
+        n_new = k.size(1)
+        end = self.length + n_new
+        while len(self.block_table) < self.pool.blocks_needed(end):
+            self.block_table.append(self.pool.allocate())
+
+        positions = torch.arange(self.length, end, device=self.pool.k.device)
+        phys, offsets = self._physical(positions)
+        # advanced index on (block, offset) -> (n_new, heads, d_head) on the LHS
+        self.pool.k[phys, :, offsets, :] = k.permute(1, 0, 2).to(self.pool.k.dtype)
+        self.pool.v[phys, :, offsets, :] = v.permute(1, 0, 2).to(self.pool.v.dtype)
+        self.length = end
+
+    def materialize(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gather the cached K, V into contiguous (heads, length, d_head)."""
+        positions = torch.arange(self.length, device=self.pool.k.device)
+        phys, offsets = self._physical(positions)
+        k = self.pool.k[phys, :, offsets, :].permute(1, 0, 2)  # (heads, length, d_head)
+        v = self.pool.v[phys, :, offsets, :].permute(1, 0, 2)
+        return k, v
+
+    def free(self) -> None:
+        """Release this request's blocks back to the pool."""
+        self.pool.free(self.block_table)
+        self.block_table = []
+        self.length = 0
