@@ -92,6 +92,35 @@ def test_varlen_with_per_request_cache_matches_individual(use_flash_attn):
 
 
 @torch.no_grad()
+@pytest.mark.parametrize("use_flash_attn", [False, True])
+def test_varlen_interleaved_decode_prefill_decode(use_flash_attn):
+    """A batch interleaving the two attention regimes — decode | fresh prefill |
+    decode — must match running each sequence alone, pinning the dispatch and
+    the scatter of per-regime results back to original token slots."""
+    torch.manual_seed(0)
+    model = TransformerLM(**SMALL_CONFIG, use_flash_attn=use_flash_attn).eval()
+    sa, sb, sc = make_sequences([6, 5, 7], SMALL_CONFIG["vocab_size"])
+    ref_a, ref_b, ref_c = (model(s.unsqueeze(0))[0] for s in (sa, sb, sc))
+
+    caches = [model.new_kv_cache() for _ in range(3)]
+
+    # Advance A and C to position 4 via their own prefill steps.
+    for s, cache in ((sa, caches[0]), (sc, caches[2])):
+        model.forward_varlen(s[:4], torch.tensor([0, 4]), torch.arange(4), request_kv_caches=[cache])
+
+    # Mixed step: decode A's token 4 | prefill all of B | decode C's token 4.
+    flat = torch.cat([sa[4:5], sb, sc[4:5]])
+    cu = torch.tensor([0, 1, 6, 7])
+    pos = torch.cat([torch.tensor([4]), torch.arange(5), torch.tensor([4])])
+    logits = model.forward_varlen(flat, cu, pos, request_kv_caches=caches)
+
+    assert torch.allclose(logits[0], ref_a[4], atol=1e-4)
+    assert torch.allclose(logits[1:6], ref_b, atol=1e-4)
+    assert torch.allclose(logits[6], ref_c[4], atol=1e-4)
+    assert [c[0].length for c in caches] == [5, 5, 5]
+
+
+@torch.no_grad()
 def test_varlen_position_ids_derived_when_omitted():
     """forward_varlen should derive per-sequence positions from cu_seqlens."""
     torch.manual_seed(0)

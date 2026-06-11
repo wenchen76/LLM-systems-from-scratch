@@ -612,8 +612,12 @@ class CausalMultiHeadSelfAttention(nn.Module):
         history plus its new tokens — the mixed prefill+decode path used by
         continuous batching. Without it, each sequence is a fresh prefill.
 
-        (Production stacks fuse this into flash_attn_varlen_func, which is
-        CUDA-only; here it is done explicitly per block.)
+        Sequences are dispatched by regime — prefill (a run of new tokens) vs
+        decode (one new token over cached history) — because the two parallelize
+        differently: prefill has many queries per sequence, decode must split
+        along the KV length instead. Each group is an explicit per-sequence loop
+        here; production fuses each into a single kernel (varlen flash attention
+        for prefill, flash-decoding for decode).
         """
         total_tokens, d_model = x.shape
         assert d_model == self.d_model
@@ -632,31 +636,76 @@ class CausalMultiHeadSelfAttention(nn.Module):
         Q = self.positional_encoder(Q, pos)
         K = self.positional_encoder(K, pos)
 
-        # Attend within each sequence block, then stitch back together. Masks are
-        # built explicitly (True = attend) so the non-square decode case works.
+        # Attention is the only op that mixes the sequence dimension. Split the
+        # sequences by regime and attend each group, scattering results back to
+        # every token's original slot (the groups may interleave in the batch).
         bounds = cu_seqlens.tolist()
-        outputs = []
+        prefill_seqs, decode_seqs = [], []
         for i, (start, end) in enumerate(zip(bounds[:-1], bounds[1:])):
-            q, k, v = Q[:, start:end], K[:, start:end], V[:, start:end]  # (heads, q_len, d_head)
-            q_len = end - start
-            if kv_caches is None:
-                attn_mask = torch.tril(torch.ones(q_len, q_len, device=x.device, dtype=torch.bool))
+            cache = kv_caches[i] if kv_caches is not None else None
+            if cache is not None and end - start == 1:
+                decode_seqs.append((start, cache))
             else:
-                past_len = kv_caches[i].length
-                k, v = kv_caches[i].append(k, v)  # (heads, past_len + q_len, d_head)
-                kv_len = k.size(-2)
-                # Query a (absolute position past_len + a) attends to keys 0..past_len+a.
-                q_pos = torch.arange(past_len, past_len + q_len, device=x.device).unsqueeze(-1)
-                k_pos = torch.arange(kv_len, device=x.device).unsqueeze(0)
-                attn_mask = k_pos <= q_pos  # (q_len, kv_len)
-            if self.use_flash_attn:
-                outputs.append(torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask))
-            else:
-                outputs.append(scaled_dot_product_attention(q, k, v, attn_mask))
-        attn_output = torch.cat(outputs, dim=1)  # (heads, total_tokens, d_head)
+                prefill_seqs.append((start, end, cache))
+
+        attn_output = torch.empty_like(V)  # (heads, total_tokens, d_head)
+        self._attend_prefill(Q, K, V, prefill_seqs, attn_output)
+        self._attend_decode(Q, K, V, decode_seqs, attn_output)
 
         attn_output = rearrange(attn_output, "heads tokens d -> tokens (heads d)").contiguous()
         return self.output_proj(attn_output)
+
+    def _attend_prefill(
+        self,
+        Q: Float[Tensor, " heads total_tokens d_head"],
+        K: Float[Tensor, " heads total_tokens d_head"],
+        V: Float[Tensor, " heads total_tokens d_head"],
+        seqs: list[tuple[int, int, KVCache | None]],
+        out: Float[Tensor, " heads total_tokens d_head"],
+    ) -> None:
+        """Causal attention over each sequence's run of new tokens, optionally on
+        top of cached history. Masks are built explicitly (True = attend) so the
+        non-square with-cache case works. One eager call per sequence; a fused
+        varlen kernel replaces this loop with a single launch.
+        """
+        for start, end, cache in seqs:
+            q, k, v = Q[:, start:end], K[:, start:end], V[:, start:end]  # (heads, q_len, d_head)
+            q_len = end - start
+            if cache is None:
+                attn_mask = torch.tril(torch.ones(q_len, q_len, device=q.device, dtype=torch.bool))
+            else:
+                past_len = cache.length
+                k, v = cache.append(k, v)  # (heads, past_len + q_len, d_head)
+                kv_len = k.size(-2)
+                # Query a (absolute position past_len + a) attends to keys 0..past_len+a.
+                q_pos = torch.arange(past_len, past_len + q_len, device=q.device).unsqueeze(-1)
+                k_pos = torch.arange(kv_len, device=q.device).unsqueeze(0)
+                attn_mask = k_pos <= q_pos  # (q_len, kv_len)
+            if self.use_flash_attn:
+                out[:, start:end] = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+            else:
+                out[:, start:end] = scaled_dot_product_attention(q, k, v, attn_mask)
+
+    def _attend_decode(
+        self,
+        Q: Float[Tensor, " heads total_tokens d_head"],
+        K: Float[Tensor, " heads total_tokens d_head"],
+        V: Float[Tensor, " heads total_tokens d_head"],
+        seqs: list[tuple[int, KVCache]],
+        out: Float[Tensor, " heads total_tokens d_head"],
+    ) -> None:
+        """Single-query attention over each sequence's cached history plus its
+        new token. The query sits at the newest position and sees every key, so
+        no mask is needed. One eager call per sequence; a flash-decoding kernel
+        (split along the KV length) replaces this loop with a single launch.
+        """
+        for start, cache in seqs:
+            q = Q[:, start : start + 1]  # (heads, 1, d_head)
+            k, v = cache.append(K[:, start : start + 1], V[:, start : start + 1])
+            if self.use_flash_attn:
+                out[:, start : start + 1] = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+            else:
+                out[:, start : start + 1] = scaled_dot_product_attention(q, k, v)
 
 
 def silu(x: torch.Tensor):
