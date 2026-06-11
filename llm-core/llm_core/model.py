@@ -721,16 +721,45 @@ class CausalMultiHeadSelfAttention(nn.Module):
     ) -> None:
         """Single-query attention over each sequence's cached history plus its
         new token. The query sits at the newest position and sees every key, so
-        no mask is needed. One eager call per sequence; a flash-decoding kernel
-        (split along the KV length) replaces this loop with a single launch.
+        no mask is needed.
+
+        On CUDA the whole group is one fused launch: caches are concatenated
+        along the key axis (k_starts / k_lens mark each sequence's span) and read
+        via those offsets; otherwise it falls back to one eager call per sequence.
         """
+        if not seqs:
+            return
+
+        for start, cache in seqs:
+            cache.append(K[:, start : start + 1], V[:, start : start + 1])
+
+        if self.use_flash_attn and Q.is_cuda:
+            try:
+                from llm_systems.kernels.triton_flash_attention import flash_decode
+            except ImportError:
+                flash_decode = None
+            if flash_decode is not None:
+                device = Q.device
+                k_flat = torch.cat([cache.k for _, cache in seqs], dim=1).contiguous()
+                v_flat = torch.cat([cache.v for _, cache in seqs], dim=1).contiguous()
+                lens = [cache.k.size(1) for _, cache in seqs]
+                starts = [0]
+                for length in lens[:-1]:
+                    starts.append(starts[-1] + length)
+                flash_decode(
+                    Q.contiguous(), k_flat, v_flat, out,
+                    torch.tensor([s for s, _ in seqs], device=device, dtype=torch.int32),
+                    torch.tensor(starts, device=device, dtype=torch.int32),
+                    torch.tensor(lens, device=device, dtype=torch.int32),
+                )
+                return
+
         for start, cache in seqs:
             q = Q[:, start : start + 1]  # (heads, 1, d_head)
-            k, v = cache.append(K[:, start : start + 1], V[:, start : start + 1])
             if self.use_flash_attn:
-                out[:, start : start + 1] = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+                out[:, start : start + 1] = torch.nn.functional.scaled_dot_product_attention(q, cache.k, cache.v)
             else:
-                out[:, start : start + 1] = scaled_dot_product_attention(q, k, v)
+                out[:, start : start + 1] = scaled_dot_product_attention(q, cache.k, cache.v)
 
 
 def silu(x: torch.Tensor):

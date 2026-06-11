@@ -108,6 +108,107 @@ def _flash_prefill_varlen_kernel(
     tl.store(O_block_ptr, o_i.to(O_ptr.dtype.element_ty), boundary_check=(0, 1))
 
 
+def _decode_configs():
+    return [
+        triton.Config({"K_TILE": kt}, num_warps=w, num_stages=s)
+        for kt in (32, 64, 128, 256)
+        for w in (2, 4, 8)
+        for s in (2, 3)
+    ]
+
+
+@triton.autotune(configs=_decode_configs(), key=["D"])
+@triton.jit
+def _flash_decode_kernel(
+    Q_ptr, K_ptr, V_ptr, O_ptr,
+    q_pos_ptr, k_starts_ptr, k_lens_ptr,
+    stride_qh, stride_qt, stride_qd,
+    stride_kh, stride_kt, stride_kd,
+    num_decode,
+    scale,
+    D: tl.constexpr,
+    K_TILE: tl.constexpr,
+):
+    hs = tl.program_id(0)
+    seq = hs % num_decode
+    head = hs // num_decode
+
+    q_pos = tl.load(q_pos_ptr + seq)
+    k_start = tl.load(k_starts_ptr + seq)
+    k_len = tl.load(k_lens_ptr + seq)
+
+    d_range = tl.arange(0, D)
+    q = tl.load(Q_ptr + head * stride_qh + q_pos * stride_qt + d_range * stride_qd).to(tl.float32) * scale
+
+    K_block_ptr = tl.make_block_ptr(
+        K_ptr + head * stride_kh + k_start * stride_kt, shape=(k_len, D),
+        strides=(stride_kt, stride_kd), offsets=(0, 0), block_shape=(K_TILE, D), order=(1, 0),
+    )
+    V_block_ptr = tl.make_block_ptr(
+        V_ptr + head * stride_kh + k_start * stride_kt, shape=(k_len, D),
+        strides=(stride_kt, stride_kd), offsets=(0, 0), block_shape=(K_TILE, D), order=(1, 0),
+    )
+
+    m_i = -float("inf")
+    l_i = 0.0
+    acc = tl.zeros((D,), dtype=tl.float32)
+
+    # The decode query sits at the newest position, so it sees every cached key —
+    # no causal mask, just the boundary mask for the ragged tail.
+    for k_tile in range(tl.cdiv(k_len, K_TILE)):
+        k = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
+        v = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
+        offs = k_tile * K_TILE + tl.arange(0, K_TILE)
+        s = tl.sum(q[None, :] * k, axis=1)  # (K_TILE,) — matrix-vector, q_len == 1
+        s = tl.where(offs < k_len, s, -float("inf"))
+
+        m_new = tl.maximum(m_i, tl.max(s, axis=0))
+        p = tl.math.exp(s - m_new)
+        alpha = tl.math.exp(m_i - m_new)
+        l_i = l_i * alpha + tl.sum(p, axis=0)
+        acc = acc * alpha + tl.sum(p[:, None] * v, axis=0)
+        m_i = m_new
+
+        K_block_ptr = K_block_ptr.advance((K_TILE, 0))
+        V_block_ptr = V_block_ptr.advance((K_TILE, 0))
+
+    acc = acc / l_i
+    tl.store(O_ptr + head * stride_qh + q_pos * stride_qt + d_range * stride_qd,
+             acc.to(O_ptr.dtype.element_ty))
+
+
+def flash_decode(
+    Q: torch.Tensor,
+    K_flat: torch.Tensor,
+    V_flat: torch.Tensor,
+    out: torch.Tensor,
+    q_positions: torch.Tensor,
+    k_starts: torch.Tensor,
+    k_lens: torch.Tensor,
+) -> None:
+    """Single-query decode attention (no split-K) for a batch of sequences.
+
+    Q, out: (heads, total_tokens, d_head). K_flat, V_flat: (heads, total_kv,
+    d_head) — the running sequences' caches concatenated along the key axis.
+    q_positions: (num_seqs,) flat-token index of each decode query. k_starts /
+    k_lens: (num_seqs,) each sequence's span in K_flat. One program per
+    (head, seq) attends over that sequence's full cache; out is written at
+    q_positions.
+    """
+    heads, _, d = Q.shape
+    num_decode = q_positions.numel()
+    grid = (heads * num_decode,)
+    _flash_decode_kernel[grid](
+        Q, K_flat, V_flat, out,
+        q_positions, k_starts, k_lens,
+        Q.stride(0), Q.stride(1), Q.stride(2),
+        K_flat.stride(0), K_flat.stride(1), K_flat.stride(2),
+        num_decode,
+        1.0 / (d ** 0.5),
+        D=d,
+    )
+
+
 def flash_prefill_varlen(
     Q: torch.Tensor,
     K: torch.Tensor,
