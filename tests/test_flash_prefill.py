@@ -40,7 +40,9 @@ def test_flash_prefill_varlen_matches_eager(dtype):
         out,
     )
 
-    atol = 1e-4 if dtype == torch.float32 else 2e-2
+    # fp32 tl.dot uses TF32 tensor cores on Ampere+ (~1e-3 precision), so the
+    # output is not bit-exact against the reference.
+    atol = 4e-3 if dtype == torch.float32 else 2e-2
     for s, L in zip(starts, lengths):
         ref = F.scaled_dot_product_attention(Q[:, s:s + L], K[:, s:s + L], V[:, s:s + L], is_causal=True)
         got = out[:, s:s + L]
