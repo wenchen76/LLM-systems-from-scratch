@@ -665,19 +665,44 @@ class CausalMultiHeadSelfAttention(nn.Module):
     ) -> None:
         """Causal attention over each sequence's run of new tokens, optionally on
         top of cached history. Masks are built explicitly (True = attend) so the
-        non-square with-cache case works. One eager call per sequence; a fused
-        varlen kernel replaces this loop with a single launch.
+        non-square with-cache case works.
+
+        On CUDA with no cached history (the common case) the whole group is one
+        fused varlen kernel launch; otherwise (CPU, or chunked prefill over a
+        non-empty cache) it falls back to one eager call per sequence.
         """
+        if not seqs:
+            return
+
+        # Append new K/V to each cache for later decode steps (bookkeeping); read
+        # past lengths first so we can tell empty-cache prefill from chunked.
+        past_lens = [cache.length if cache is not None else 0 for _, _, cache in seqs]
         for start, end, cache in seqs:
-            q, k, v = Q[:, start:end], K[:, start:end], V[:, start:end]  # (heads, q_len, d_head)
+            if cache is not None:
+                cache.append(K[:, start:end], V[:, start:end])
+
+        fresh = all(p == 0 for p in past_lens)  # no cached history -> plain causal self-attention
+        if self.use_flash_attn and Q.is_cuda and fresh:
+            try:
+                from llm_systems.kernels.triton_flash_attention import flash_prefill_varlen
+            except ImportError:
+                flash_prefill_varlen = None
+            if flash_prefill_varlen is not None:
+                device = Q.device
+                starts = torch.tensor([s for s, _, _ in seqs], device=device, dtype=torch.int32)
+                lengths = torch.tensor([e - s for s, e, _ in seqs], device=device, dtype=torch.int32)
+                flash_prefill_varlen(Q.contiguous(), K.contiguous(), V.contiguous(), starts, lengths, out)
+                return
+
+        for (start, end, cache), past_len in zip(seqs, past_lens):
+            q = Q[:, start:end]
             q_len = end - start
             if cache is None:
+                k, v = K[:, start:end], V[:, start:end]
                 attn_mask = torch.tril(torch.ones(q_len, q_len, device=q.device, dtype=torch.bool))
             else:
-                past_len = cache.length
-                k, v = cache.append(k, v)  # (heads, past_len + q_len, d_head)
+                k, v = cache.k, cache.v  # already appended above -> past + new
                 kv_len = k.size(-2)
-                # Query a (absolute position past_len + a) attends to keys 0..past_len+a.
                 q_pos = torch.arange(past_len, past_len + q_len, device=q.device).unsqueeze(-1)
                 k_pos = torch.arange(kv_len, device=q.device).unsqueeze(0)
                 attn_mask = k_pos <= q_pos  # (q_len, kv_len)
