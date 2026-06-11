@@ -153,17 +153,26 @@ class LLMEngine:
     def _sample(self, logits: torch.Tensor) -> torch.Tensor:
         """Per-request sampling over (R, vocab) logits aligned with self.running.
 
-        Temperature is applied vectorized; top-k (which can differ per request)
-        is masked per row, then one multinomial draw covers the whole batch.
+        Fully vectorized: temperature divides per row, and top-k (which may
+        differ per request) masks each row below its own k-th largest logit via
+        one batched topk + a per-row gather of the threshold — no Python loop —
+        then one multinomial draw covers the whole batch.
         """
-        temps = torch.tensor([r.sampling.temperature for r in self.running], device=logits.device)
+        device = logits.device
+        temps = torch.tensor([r.sampling.temperature for r in self.running], device=device)
         scaled = logits / temps.unsqueeze(-1)
-        for row, req in enumerate(self.running):
-            k = req.sampling.top_k
-            if k:
-                k = min(k, scaled.size(-1))
-                threshold = torch.topk(scaled[row], k).values[-1]
-                scaled[row] = scaled[row].masked_fill(scaled[row] < threshold, float("-inf"))
+
+        ks = [r.sampling.top_k for r in self.running]
+        if any(ks):
+            vocab = scaled.size(-1)
+            k_per_row = torch.tensor([min(k, vocab) if k else 0 for k in ks], device=device)
+            max_k = int(k_per_row.max())
+            kth = torch.topk(scaled, max_k, dim=-1).values.gather(  # each row's k-th largest logit
+                1, (k_per_row - 1).clamp(min=0).unsqueeze(1)
+            )
+            kth = kth.masked_fill((k_per_row == 0).unsqueeze(1), float("-inf"))  # rows without top-k keep all
+            scaled = scaled.masked_fill(scaled < kth, float("-inf"))
+
         probs = torch.softmax(scaled, dim=-1)
         return torch.multinomial(probs, 1).squeeze(-1)  # (R,)
 

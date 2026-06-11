@@ -7,7 +7,7 @@ deterministic.
 """
 import torch
 
-from llm_core.engine import LLMEngine, RequestState, SamplingParams
+from llm_core.engine import LLMEngine, Request, RequestState, SamplingParams
 from llm_core.model import TransformerLM
 
 SMALL_CONFIG = {
@@ -92,6 +92,25 @@ def test_per_request_max_tokens_honored():
     assert len(done[0].output_ids) == 8 and done[0].finish_reason == "length"
     assert len(done[1].output_ids) == 20
     assert all(r.state is RequestState.FINISHED for r in done.values())
+
+
+def test_vectorized_sampling_respects_per_request_top_k():
+    """The vectorized _sample must mask each row by its own k: every sampled
+    token stays within that request's top-k set (None = unrestricted)."""
+    torch.manual_seed(0)
+    engine = LLMEngine(make_model(), device="cpu")
+    ks = [1, 5, None, 50]
+    engine.running = [Request(i, [1], SamplingParams(top_k=k)) for i, k in enumerate(ks)]
+
+    vocab = 200
+    logits = torch.randn(len(ks), vocab)
+    allowed = [set(torch.topk(logits[i], k).indices.tolist()) if k else None for i, k in enumerate(ks)]
+
+    for _ in range(50):  # multinomial is stochastic; every draw must stay in-set
+        tokens = engine._sample(logits)
+        for i, k in enumerate(ks):
+            if k:
+                assert tokens[i].item() in allowed[i]
 
 
 def test_eos_stops_request_early():
