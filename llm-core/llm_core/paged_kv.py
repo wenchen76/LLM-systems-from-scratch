@@ -117,3 +117,26 @@ class PagedKVCache:
         self.pool.free(self.block_table)
         self.block_table = []
         self.length = 0
+
+
+def append_decode(caches: list[PagedKVCache], k_new: torch.Tensor, v_new: torch.Tensor) -> None:
+    """Append exactly one new token to each of several caches sharing one pool, in
+    a single batched scatter. k_new, v_new are (heads, R, d_head); column i belongs
+    to caches[i].
+
+    This is the decode hot path: it replaces R per-cache append() calls — each of
+    which would rebuild a block-table tensor and copy it to the GPU — with two small
+    index transfers (block id + offset) and one scatter, regardless of R.
+    """
+    pool = caches[0].pool
+    bs = pool.block_size
+    for cache in caches:  # grow a table by one block only when the new token spills over (rare)
+        if cache.length // bs >= len(cache.block_table):
+            cache.block_table.append(pool.allocate())
+    device = pool.k.device
+    phys = torch.tensor([c.block_table[c.length // bs] for c in caches], device=device)
+    offset = torch.tensor([c.length % bs for c in caches], device=device)
+    pool.k[phys, :, offset, :] = k_new.permute(1, 0, 2).to(pool.k.dtype)  # (R, heads, d_head)
+    pool.v[phys, :, offset, :] = v_new.permute(1, 0, 2).to(pool.v.dtype)
+    for cache in caches:
+        cache.length += 1

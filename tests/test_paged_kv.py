@@ -2,7 +2,7 @@
 import pytest
 import torch
 
-from llm_core.paged_kv import BlockPool, PagedKVCache
+from llm_core.paged_kv import BlockPool, PagedKVCache, append_decode
 
 
 def make_pool(num_blocks=8, block_size=4, num_heads=2, d_head=16):
@@ -73,6 +73,39 @@ def test_paged_cache_matches_contiguous_reference():
     assert mk.shape == (heads, length, d)
     assert torch.allclose(mk, torch.cat(ref_k, dim=1))
     assert torch.allclose(mv, torch.cat(ref_v, dim=1))
+
+
+def test_append_decode_batches_match_per_cache_append():
+    """The batched decode append (one scatter for many caches) must leave every
+    cache identical to calling append() on each one — across a block boundary, with
+    caches at different lengths so they cross blocks on different steps."""
+    torch.manual_seed(0)
+    heads, d, block_size, R = 2, 16, 4, 5
+    batched_pool = BlockPool(num_blocks=32, block_size=block_size, num_heads=heads, d_head=d)
+    ref_pool = BlockPool(num_blocks=32, block_size=block_size, num_heads=heads, d_head=d)
+    batched = [PagedKVCache(batched_pool) for _ in range(R)]
+    ref = [PagedKVCache(ref_pool) for _ in range(R)]
+
+    # Seed each cache with a different prefill length so steps cross blocks staggered.
+    for i in range(R):
+        n = i + 2
+        k, v = torch.randn(heads, n, d), torch.randn(heads, n, d)
+        batched[i].append(k.clone(), v.clone())
+        ref[i].append(k.clone(), v.clone())
+
+    for _ in range(6):  # decode steps, enough to cross block boundaries
+        k = torch.randn(heads, R, d)  # column i -> cache i
+        v = torch.randn(heads, R, d)
+        append_decode(batched, k, v)
+        for i in range(R):
+            ref[i].append(k[:, i : i + 1], v[:, i : i + 1])
+
+    for b, r in zip(batched, ref):
+        assert b.length == r.length
+        assert b.block_table == r.block_table
+        bk, bv = b.materialize()
+        rk, rv = r.materialize()
+        assert torch.allclose(bk, rk) and torch.allclose(bv, rv)
 
 
 def test_paged_cache_free_returns_blocks():

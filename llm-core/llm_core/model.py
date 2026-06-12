@@ -15,6 +15,7 @@ import torch.cuda.nvtx as nvtx
 
 
 from .nn_functional import softmax
+from .paged_kv import append_decode
 
 logger = logging.getLogger(__name__)
 
@@ -750,8 +751,15 @@ class CausalMultiHeadSelfAttention(nn.Module):
         if not seqs:
             return
 
-        for start, cache in seqs:
-            cache.append(K[:, start : start + 1], V[:, start : start + 1])
+        # Write each sequence's new token to its cache. Paged caches share one pool,
+        # so all the writes batch into a single scatter; contiguous caches append one
+        # at a time.
+        if seqs[0][1].is_paged:
+            cols = [start for start, _ in seqs]
+            append_decode([cache for _, cache in seqs], K[:, cols, :], V[:, cols, :])
+        else:
+            for start, cache in seqs:
+                cache.append(K[:, start : start + 1], V[:, start : start + 1])
 
         if self.use_flash_attn and Q.is_cuda:
             try:
@@ -765,11 +773,10 @@ class CausalMultiHeadSelfAttention(nn.Module):
                 if seqs[0][1].is_paged:
                     # Paged: read KV straight from the pool via per-sequence block tables.
                     pool = seqs[0][1].pool
-                    max_blocks = max(len(cache.block_table) for _, cache in seqs)
-                    block_tables = torch.zeros(len(seqs), max_blocks, device=device, dtype=torch.int32)
-                    for i, (_, cache) in enumerate(seqs):
-                        bt = cache.block_table
-                        block_tables[i, : len(bt)] = torch.tensor(bt, device=device, dtype=torch.int32)
+                    tables = [cache.block_table for _, cache in seqs]
+                    max_blocks = max(len(t) for t in tables)
+                    padded = [t + [0] * (max_blocks - len(t)) for t in tables]
+                    block_tables = torch.tensor(padded, device=device, dtype=torch.int32)  # one transfer, not R
                     paged_decode(Q.contiguous(), pool.k, pool.v, out,
                                  q_positions, block_tables, seq_lens, pool.block_size)
                 else:
