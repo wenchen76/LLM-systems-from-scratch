@@ -19,7 +19,7 @@ from enum import Enum
 
 import torch
 
-from llm_core.model import KVCache, TransformerLM
+from llm_core.model import KVCacheLike, TransformerLM
 from llm_core.paged_kv import BlockPool, PagedKVCache
 
 
@@ -47,7 +47,7 @@ class Request:
     prompt_ids: list[int]
     sampling: SamplingParams
     output_ids: list[int] = field(default_factory=list)
-    kv_caches: list[KVCache] | None = None  # per-layer; allocated at admission
+    kv_caches: list[KVCacheLike] | None = None  # per-layer; allocated at admission
     state: RequestState = RequestState.WAITING
     prefilled: bool = False
     finish_reason: str | None = None

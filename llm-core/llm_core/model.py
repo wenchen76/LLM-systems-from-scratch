@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 from jaxtyping import Float, Bool, Int
+from typing import Protocol
 import torch.cuda.nvtx as nvtx
 
 
@@ -481,6 +482,23 @@ def scaled_dot_product_attention (
     return einsum(attention_weights, V, "... query key, ... key d_v -> ... query d_v")
 
 
+class KVCacheLike(Protocol):
+    """What attention/engine need from a per-layer KV cache, contiguous or paged.
+
+    A structural interface (no inheritance): KVCache and PagedKVCache satisfy it
+    by exposing these members. is_paged drives the attention dispatch.
+    """
+
+    is_paged: bool
+    length: int
+
+    @property
+    def k(self) -> Tensor: ...
+    @property
+    def v(self) -> Tensor: ...
+    def append(self, k: Tensor, v: Tensor) -> object: ...
+
+
 class KVCache:
     """Per-layer key/value cache for incremental (autoregressive) decoding.
 
@@ -491,6 +509,8 @@ class KVCache:
     This is mutated in place so attention can keep returning a plain tensor,
     leaving the training / full-forward path untouched.
     """
+
+    is_paged = False
 
     def __init__(self):
         self.k: torch.Tensor | None = None
@@ -742,7 +762,7 @@ class CausalMultiHeadSelfAttention(nn.Module):
                 device = Q.device
                 q_positions = torch.tensor([s for s, _ in seqs], device=device, dtype=torch.int32)
                 seq_lens = torch.tensor([cache.length for _, cache in seqs], device=device, dtype=torch.int32)
-                if hasattr(seqs[0][1], "block_table"):
+                if seqs[0][1].is_paged:
                     # Paged: read KV straight from the pool via per-sequence block tables.
                     pool = seqs[0][1].pool
                     max_blocks = max(len(cache.block_table) for _, cache in seqs)

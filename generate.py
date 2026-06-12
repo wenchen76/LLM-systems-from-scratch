@@ -55,6 +55,9 @@ def main():
                         help="Device to use (auto, cpu, cuda)")
     parser.add_argument("--no-flash-attn", action="store_true",
                         help="Disable FlashAttention (PyTorch SDPA); enabled by default")
+    parser.add_argument("--paged", action="store_true", help="Use a paged KV cache")
+    parser.add_argument("--block-size", type=int, default=16, help="Paged KV block size")
+    parser.add_argument("--num-blocks", type=int, default=2048, help="Paged KV blocks per layer")
     args = parser.parse_args()
 
     if args.device == "auto":
@@ -78,7 +81,8 @@ def main():
     tokenizer = Tokenizer.from_files(args.vocab, args.merges, special_tokens=["<|endoftext|>"])
     eos_token_id = tokenizer.encode("<|endoftext|>")[0] if "<|endoftext|>" in tokenizer.special_tokens else None
 
-    engine = LLMEngine(model, device=device)
+    engine = LLMEngine(model, device=device, paged=args.paged,
+                       block_size=args.block_size, num_blocks=args.num_blocks)
     sampling = SamplingParams(
         max_tokens=args.max_tokens,
         temperature=args.temperature,

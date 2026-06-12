@@ -68,6 +68,8 @@ class PagedKVCache:
     the paged attention kernel will instead read the pool via the block table.
     """
 
+    is_paged = True
+
     def __init__(self, pool: BlockPool):
         self.pool = pool
         self.block_table: list[int] = []

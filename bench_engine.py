@@ -64,8 +64,8 @@ def _log(label, steps, engine, done, total, log_every):
         print(f"  [{label}] step {steps:4d}  running={len(engine.running):3d}  done={done}/{total}", flush=True)
 
 
-def run_continuous(model, requests, batch, device, trace=None, label="continuous", log_every=0):
-    engine = LLMEngine(model, device=device, max_running=batch)
+def run_continuous(model, requests, batch, device, trace=None, label="continuous", log_every=0, engine_kwargs=None):
+    engine = LLMEngine(model, device=device, max_running=batch, **(engine_kwargs or {}))
     for prompt, sp in requests:
         engine.add_request(prompt, sp)
     steps = done = 0
@@ -78,9 +78,9 @@ def run_continuous(model, requests, batch, device, trace=None, label="continuous
     return steps
 
 
-def run_static(model, requests, batch, device, trace=None, label="static", log_every=0):
+def run_static(model, requests, batch, device, trace=None, label="static", log_every=0, engine_kwargs=None):
     """Admit in fixed waves; the next wave waits until the current one fully drains."""
-    engine = LLMEngine(model, device=device, max_running=batch)
+    engine = LLMEngine(model, device=device, max_running=batch, **(engine_kwargs or {}))
     i, steps, done = 0, 0, 0
     while i < len(requests) or engine.running:
         if not engine.running:  # current wave drained -> admit the next
@@ -122,6 +122,9 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--trace", action="store_true",
                         help="Print per-step batch occupancy (slot utilization) for both policies")
+    parser.add_argument("--paged", action="store_true", help="Use a paged KV cache")
+    parser.add_argument("--block-size", type=int, default=16, help="Paged KV block size")
+    parser.add_argument("--num-blocks", type=int, default=2048, help="Paged KV blocks per layer")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -130,22 +133,23 @@ def main():
     model = TransformerLM(**model_cfg, use_flash_attn=True).to(device=args.device, dtype=dtype).eval()
     requests = make_requests(args.requests, model_cfg["vocab_size"], seed=args.seed)
     tokens = total_tokens(requests)
+    engine_kwargs = dict(paged=args.paged, block_size=args.block_size, num_blocks=args.num_blocks)
 
     print(f"device={args.device} dtype={args.dtype} d_model={model_cfg['d_model']} layers={model_cfg['num_layers']} "
-          f"requests={args.requests} slots={args.batch} tokens_to_generate={tokens}")
+          f"requests={args.requests} slots={args.batch} paged={args.paged} tokens_to_generate={tokens}")
     print(f"output lengths: min={min(sp.max_tokens for _, sp in requests)} "
           f"max={max(sp.max_tokens for _, sp in requests)}")
 
     # Warm up kernels / allocator.
     print("warming up...", flush=True)
-    time_run(lambda: run_continuous(model, requests[:args.batch], args.batch, args.device), args.device)
+    time_run(lambda: run_continuous(model, requests[:args.batch], args.batch, args.device, engine_kwargs=engine_kwargs), args.device)
 
     print("running static batching...", flush=True)
     static_t, static_steps = time_run(
-        lambda: run_static(model, requests, args.batch, args.device, label="static", log_every=20), args.device)
+        lambda: run_static(model, requests, args.batch, args.device, label="static", log_every=20, engine_kwargs=engine_kwargs), args.device)
     print("running continuous batching...", flush=True)
     cont_t, cont_steps = time_run(
-        lambda: run_continuous(model, requests, args.batch, args.device, label="continuous", log_every=20), args.device)
+        lambda: run_continuous(model, requests, args.batch, args.device, label="continuous", log_every=20, engine_kwargs=engine_kwargs), args.device)
 
     print("-" * 60)
     print(f"static batching     : {static_t:6.2f}s  {static_steps:4d} steps  {tokens / static_t:8.1f} tok/s")
@@ -154,8 +158,8 @@ def main():
 
     if args.trace:
         st, ct = [], []
-        run_static(model, requests, args.batch, args.device, trace=st)
-        run_continuous(model, requests, args.batch, args.device, trace=ct)
+        run_static(model, requests, args.batch, args.device, trace=st, engine_kwargs=engine_kwargs)
+        run_continuous(model, requests, args.batch, args.device, trace=ct, engine_kwargs=engine_kwargs)
         print(f"\nslot occupancy per step (each bar = running / {args.batch} slots):")
         print(f"  static     |{sparkline(st, args.batch)}|  (drains to empty between waves)")
         print(f"  continuous |{sparkline(ct, args.batch)}|  (stays full, refilled mid-flight)")
