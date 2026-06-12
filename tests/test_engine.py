@@ -49,6 +49,21 @@ def test_engine_greedy_matches_sequential_generate():
     assert not engine.has_work()
 
 
+def test_paged_engine_greedy_matches_sequential():
+    """End-to-end paging: continuous batching over a paged KV cache must produce
+    the same tokens as sequential generate, and all blocks return to the pool."""
+    model = make_model()
+    prompts = make_prompts([5, 12, 3, 8], SMALL_CONFIG["vocab_size"])
+    sp = SamplingParams(max_tokens=20, top_k=1)
+
+    engine = LLMEngine(model, device="cpu", paged=True, block_size=4, num_blocks=512)
+    outputs = engine.generate(prompts, sp)
+
+    for prompt, out in zip(prompts, outputs):
+        assert out == greedy_reference(model, prompt, 20)
+    assert all(pool.num_free == pool.num_blocks for pool in engine.pools)  # no block leak
+
+
 def test_continuous_batching_with_capacity_limit_and_mid_flight_admission():
     """max_running smaller than the queue forces requests to wait and be admitted
     as slots free up; a request added mid-run must also complete correctly."""

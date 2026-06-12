@@ -20,6 +20,7 @@ from enum import Enum
 import torch
 
 from llm_core.model import KVCache, TransformerLM
+from llm_core.paged_kv import BlockPool, PagedKVCache
 
 
 @dataclass
@@ -60,7 +61,8 @@ class Request:
 class LLMEngine:
     """Iteration-level scheduler for continuous batching."""
 
-    def __init__(self, model: TransformerLM, device: str = "cpu", max_running: int = 64):
+    def __init__(self, model: TransformerLM, device: str = "cpu", max_running: int = 64,
+                 paged: bool = False, block_size: int = 16, num_blocks: int = 4096):
         self.model = model.eval()
         self.device = device
         self.context_length = model.context_length
@@ -68,6 +70,25 @@ class LLMEngine:
         self.waiting: deque[Request] = deque()
         self.running: list[Request] = []
         self._next_id = 0
+
+        # Optional paged KV: one block pool per layer, shared by all requests.
+        self.paged = paged
+        self.pools = None
+        if paged:
+            cfg = model.config
+            num_heads = cfg["num_heads"]
+            d_head = cfg["d_model"] // num_heads
+            dtype = next(model.parameters()).dtype
+            self.pools = [
+                BlockPool(num_blocks, block_size, num_heads, d_head, dtype=dtype, device=device)
+                for _ in range(cfg["num_layers"])
+            ]
+
+    def _new_caches(self):
+        """Per-layer KV cache for one request — paged or contiguous."""
+        if self.paged:
+            return [PagedKVCache(pool) for pool in self.pools]
+        return self.model.new_kv_cache()
 
     # ---- public API ---------------------------------------------------------
     def add_request(self, prompt_ids, sampling: SamplingParams | None = None) -> int:
@@ -102,6 +123,10 @@ class LLMEngine:
                 finished.append(req)
 
         self.running = [r for r in self.running if r.state is RequestState.RUNNING]
+        if self.paged:  # return finished requests' blocks to the pools
+            for req in finished:
+                for cache in req.kv_caches:
+                    cache.free()
         return finished
 
     def generate(self, prompts, sampling: SamplingParams | None = None) -> list[list[int]]:
@@ -118,7 +143,7 @@ class LLMEngine:
         """Move waiting requests into the running set, allocating their KV caches."""
         while self.waiting and len(self.running) < self.max_running:
             req = self.waiting.popleft()
-            req.kv_caches = self.model.new_kv_cache()
+            req.kv_caches = self._new_caches()
             req.state = RequestState.RUNNING
             self.running.append(req)
 

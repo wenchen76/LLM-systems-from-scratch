@@ -101,6 +101,15 @@ class PagedKVCache:
         v = self.pool.v[phys, :, offsets, :].permute(1, 0, 2)
         return k, v
 
+    # KVCache-compatible views so eager attention can use a paged cache unchanged.
+    @property
+    def k(self) -> torch.Tensor:
+        return self.materialize()[0]
+
+    @property
+    def v(self) -> torch.Tensor:
+        return self.materialize()[1]
+
     def free(self) -> None:
         """Release this request's blocks back to the pool."""
         self.pool.free(self.block_table)
