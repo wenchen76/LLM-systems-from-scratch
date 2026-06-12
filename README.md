@@ -23,8 +23,8 @@ usually hide behind their APIs:
   backprop; custom FSDP/ZeRO-3 shards parameters, gradients, and optimizer state
   with explicit all-gather / reduce-scatter scheduling.
 - **Inference serving** — a continuous-batching engine with per-request KV
-  caches, iteration-level scheduling, and selective (variable-length) batching
-  that mixes prefill and decode in a single forward.
+  caches, iteration-level scheduling, PagedAttention-style block-paged KV storage 
+  and custom Triton kernels cover variable-length prefill, flash decoding, and paged decoding.
 
 ## Repository layout
 
@@ -38,6 +38,7 @@ LLM-systems-from-scratch/
 │   └── llm_core/
 │       ├── model.py             # TransformerLM: RoPE, RMSNorm, SwiGLU, causal MHA, KV cache, varlen forward
 │       ├── engine.py            # Continuous-batching inference engine (iteration-level scheduler)
+│       ├── paged_kv.py          # PagedAttention block pool + paged KV cache
 │       ├── optimizer.py         # AdamW + cosine LR schedule with warmup
 │       ├── nn_functional.py     # softmax, cross-entropy, gradient clipping
 │       └── dataloader.py        # memmap-backed batch sampler with pinned-memory copy
@@ -47,7 +48,8 @@ LLM-systems-from-scratch/
         │   ├── triton_adamw.py          # Fused AdamW optimizer update
         │   ├── triton_cross_entropy.py  # Fused logsumexp loss + in-place grad (online softmax)
         │   ├── triton_rms_norm.py       # Fused RMSNorm fwd/bwd
-        │   └── triton_swiglu.py         # Fused SiLU * up-proj
+        │   ├── triton_swiglu.py         # Fused SiLU * up-proj
+        │   └── triton_flash_attention.py # Varlen prefill, flash-decoding, and paged decode kernels
         └── parallelism/
             ├── ddp.py                   # Bucketed DDP with async all-reduce
             └── fsdp_zero3.py            # ZeRO-3 FSDP with prefetching + comm/compute overlap
@@ -306,6 +308,32 @@ between waves.
 interactive demo for concurrent prompts, and [bench_engine.py](bench_engine.py)
 compares continuous vs static admission on the same engine and kernels.
 
+### Paged KV cache (`--paged`)
+
+By default, each request owns a contiguous per-layer `KVCache`. With `--paged`,
+the engine uses a PagedAttention-style block allocator
+([paged_kv.py](llm-core/llm_core/paged_kv.py)): each layer has a pre-allocated
+pool of fixed-size KV blocks, and each request keeps a *block table* mapping
+logical token positions to physical blocks. Requests grow by taking blocks from
+the shared free list, avoiding contiguous per-request reservations and most
+external fragmentation.
+
+| Flag | What it does |
+|---|---|
+| `--paged` | Enable the paged KV cache (off by default) |
+| `--block-size N` | Tokens per KV block (default: 16) |
+| `--num-blocks N` | Pre-allocated blocks per layer; this sets the pool capacity |
+
+When a request is admitted, the engine estimates its worst-case block budget
+(`prompt + max_tokens`) and admits it only if that budget fits in the remaining
+pool capacity. The actual KV blocks are still allocated on demand as the
+request's cache grows. On CUDA, `paged_decode` reads keys and values directly
+from the paged pool through the request's block table. That avoids the
+contiguous-cache path's per-step copy, where active request caches are
+concatenated into a flat buffer before decoding. Both [generate.py](generate.py)
+and [bench_engine.py](bench_engine.py) accept `--paged --block-size
+--num-blocks`.
+
 ## Quickstart
 
 ### Install
@@ -359,6 +387,18 @@ python generate.py \
 
 Enter one prompt per line, then submit the batch with a blank line. Prompts in
 the same batch generate concurrently; use `Ctrl+C` or `Ctrl+D` to exit.
+
+Add `--paged` to serve with the block-paged KV cache, tuning the pool with
+`--block-size` / `--num-blocks`:
+
+```bash
+python generate.py \
+  --config checkpoints/sample/model_config.json \
+  --checkpoint checkpoints/sample/ckpt_final.pt \
+  --vocab vocab.json --merges merges.json \
+  --max-tokens 200 --temperature 0.8 --top-k 40 \
+  --paged --block-size 16 --num-blocks 2048
+```
 
 ## Roadmap
 
