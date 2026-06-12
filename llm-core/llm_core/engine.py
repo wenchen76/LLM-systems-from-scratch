@@ -51,6 +51,7 @@ class Request:
     state: RequestState = RequestState.WAITING
     prefilled: bool = False
     finish_reason: str | None = None
+    reserved_blocks: int = 0  # paged: worst-case blocks reserved at admission
 
     @property
     def num_cached(self) -> int:
@@ -74,6 +75,9 @@ class LLMEngine:
         # Optional paged KV: one block pool per layer, shared by all requests.
         self.paged = paged
         self.pools = None
+        self.block_size = block_size
+        self.block_capacity = num_blocks
+        self.reserved_blocks = 0  # blocks committed to running requests
         if paged:
             cfg = model.config
             num_heads = cfg["num_heads"]
@@ -123,10 +127,11 @@ class LLMEngine:
                 finished.append(req)
 
         self.running = [r for r in self.running if r.state is RequestState.RUNNING]
-        if self.paged:  # return finished requests' blocks to the pools
+        if self.paged:  # return finished requests' blocks and reservations to the pool
             for req in finished:
                 for cache in req.kv_caches:
                     cache.free()
+                self.reserved_blocks -= req.reserved_blocks
         return finished
 
     def generate(self, prompts, sampling: SamplingParams | None = None) -> list[list[int]]:
@@ -142,10 +147,30 @@ class LLMEngine:
     def _admit(self) -> None:
         """Move waiting requests into the running set, allocating their KV caches."""
         while self.waiting and len(self.running) < self.max_running:
-            req = self.waiting.popleft()
+            req = self.waiting[0]
+            if self.paged and not self._reserve_blocks(req):
+                break  # head-of-line request doesn't fit the block budget yet; wait
+            self.waiting.popleft()
             req.kv_caches = self._new_caches()
             req.state = RequestState.RUNNING
             self.running.append(req)
+
+    def _reserve_blocks(self, req: Request) -> bool:
+        """Reserve a request's worst-case blocks (prompt + max_tokens, capped at
+        context). Returns False if the budget is full so the request keeps waiting
+        — admitting only what fits guarantees the pool never runs dry mid-decode."""
+        max_len = min(len(req.prompt_ids) + req.sampling.max_tokens, self.context_length)
+        need = (max_len + self.block_size - 1) // self.block_size
+        if need > self.block_capacity:
+            raise ValueError(
+                f"request needs {need} blocks but the pool has {self.block_capacity}; "
+                "raise num_blocks or lower max_tokens"
+            )
+        if self.reserved_blocks + need > self.block_capacity:
+            return False
+        self.reserved_blocks += need
+        req.reserved_blocks = need
+        return True
 
     def _build_batch(self):
         """Flatten each running request's new tokens into one varlen batch.

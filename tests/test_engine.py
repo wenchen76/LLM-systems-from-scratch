@@ -5,6 +5,7 @@ admission and retirement) must produce exactly the same tokens as running each
 request on its own through model.generate. Greedy (top_k=1) makes the comparison
 deterministic.
 """
+import pytest
 import torch
 
 from llm_core.engine import LLMEngine, Request, RequestState, SamplingParams
@@ -62,6 +63,32 @@ def test_paged_engine_greedy_matches_sequential():
     for prompt, out in zip(prompts, outputs):
         assert out == greedy_reference(model, prompt, 20)
     assert all(pool.num_free == pool.num_blocks for pool in engine.pools)  # no block leak
+
+
+def test_paged_admission_control_queues_when_blocks_scarce():
+    """With too few blocks to run everything at once, requests queue (no
+    BlockPool exhaustion) and still finish correctly; blocks/reservations clear."""
+    model = make_model()
+    prompts = make_prompts([5, 6, 7, 8, 5, 6], SMALL_CONFIG["vocab_size"])
+    sp = SamplingParams(max_tokens=20, top_k=1)
+
+    # block_size=4: each request reserves ceil((prompt+20)/4) ~= 7 blocks, so only
+    # ~2 of 16 fit at once -> the rest must wait rather than raise.
+    engine = LLMEngine(model, device="cpu", paged=True, block_size=4, num_blocks=16, max_running=8)
+    outputs = engine.generate(prompts, sp)
+
+    for prompt, out in zip(prompts, outputs):
+        assert out == greedy_reference(model, prompt, 20)
+    assert engine.reserved_blocks == 0
+    assert all(pool.num_free == pool.num_blocks for pool in engine.pools)
+
+
+def test_paged_request_too_large_raises():
+    """A single request that can never fit the pool fails fast, not silently hangs."""
+    model = make_model()
+    engine = LLMEngine(model, device="cpu", paged=True, block_size=4, num_blocks=2, max_running=4)
+    with pytest.raises(ValueError):
+        engine.generate(make_prompts([5], SMALL_CONFIG["vocab_size"]), SamplingParams(max_tokens=20, top_k=1))
 
 
 def test_continuous_batching_with_capacity_limit_and_mid_flight_admission():
