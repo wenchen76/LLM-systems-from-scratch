@@ -334,6 +334,42 @@ concatenated into a flat buffer before decoding. Both [generate.py](generate.py)
 and [bench_engine.py](bench_engine.py) accept `--paged --block-size
 --num-blocks`.
 
+#### Benchmark
+
+Environment: A100 PCIe 80GB, GPT-3 XL
+([configures/gpt3xl.yaml](configures/gpt3xl.yaml)), BF16, and 512 requests with
+prompt lengths from 4–32 tokens and output lengths from 8–95 tokens. Each row is
+one [bench_engine.py](bench_engine.py) run. `speedup` is continuous-batching
+throughput divided by static-batching throughput; paged KV and Triton flash
+attention are toggled with `--paged` and `--no-flash-attn`.
+
+| attention | KV cache | batch | static tok/s | continuous tok/s | speedup |
+|---|---|---:|---:|---:|---:|
+| eager | contiguous | 64 | 131.2 | 137.1 | 1.05x |
+| Triton flash | contiguous | 64 | 548.8 | 693.7 | 1.26x |
+| Triton flash | paged | 64 | 755.0 | 1044.6 | 1.38x |
+| Triton flash | paged | 8 | 108.7 | 174.8 | 1.61x |
+
+The main comparisons:
+
+- **Continuous vs static** — iteration-level scheduling keeps the batch from
+  draining between waves, giving 1.05–1.61x higher throughput in these runs. For
+  this request mix, the fewer-steps factor is the speedup ceiling: about 1.62x at
+  batch 64 and 1.67x at batch 8. Smaller batches get closer to that ceiling;
+  larger batches spend more work per step on attention/KV traffic and, in the
+  contiguous path, cache concatenation.
+- **Triton flash vs eager** — with contiguous KV caches at batch 64, the custom
+  variable-length prefill and flash-decoding kernels raise continuous throughput
+  from 137.1 to 693.7 tok/s (5.1x). Static throughput rises from 131.2 to 548.8
+  tok/s (4.2x), since the eager path handles sequences one at a time.
+- **Paged vs contiguous** — with Triton flash attention at batch 64, paged KV
+  raises continuous throughput from 693.7 to 1044.6 tok/s (1.5x) by reading KV
+  directly from the block pool through request block tables, instead of
+  flattening active caches before every decode step.
+- **End-to-end** — the full serving stack (Triton flash + paged KV + continuous
+  batching) reaches 1044.6 tok/s, compared with 131.2 tok/s for the baseline
+  eager + contiguous + static path at batch 64: about **8x** faster.
+
 ## Quickstart
 
 ### Install
