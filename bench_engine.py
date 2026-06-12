@@ -119,6 +119,8 @@ def main():
     parser.add_argument("--config", type=str, default=None,
                         help="Training YAML for model dims (e.g. configures/gpt3xl.yaml); default: small built-in")
     parser.add_argument("--dtype", type=str, default="float32", choices=["float32", "float16", "bfloat16"])
+    parser.add_argument("--no-flash-attn", action="store_true",
+                        help="Disable the custom Triton flash-attention kernels (use eager attention); on by default")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--trace", action="store_true",
                         help="Print per-step batch occupancy (slot utilization) for both policies")
@@ -130,13 +132,14 @@ def main():
     torch.manual_seed(args.seed)
     model_cfg = load_model_config(args.config)
     dtype = getattr(torch, args.dtype)
-    model = TransformerLM(**model_cfg, use_flash_attn=True).to(device=args.device, dtype=dtype).eval()
+    use_flash_attn = not args.no_flash_attn
+    model = TransformerLM(**model_cfg, use_flash_attn=use_flash_attn).to(device=args.device, dtype=dtype).eval()
     requests = make_requests(args.requests, model_cfg["vocab_size"], seed=args.seed)
     tokens = total_tokens(requests)
     engine_kwargs = dict(paged=args.paged, block_size=args.block_size, num_blocks=args.num_blocks)
 
     print(f"device={args.device} dtype={args.dtype} d_model={model_cfg['d_model']} layers={model_cfg['num_layers']} "
-          f"requests={args.requests} slots={args.batch} paged={args.paged} tokens_to_generate={tokens}")
+          f"requests={args.requests} slots={args.batch} paged={args.paged} flash={use_flash_attn} tokens_to_generate={tokens}")
     print(f"output lengths: min={min(sp.max_tokens for _, sp in requests)} "
           f"max={max(sp.max_tokens for _, sp in requests)}")
 
