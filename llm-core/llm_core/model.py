@@ -735,23 +735,31 @@ class CausalMultiHeadSelfAttention(nn.Module):
 
         if self.use_flash_attn and Q.is_cuda:
             try:
-                from llm_systems.kernels.triton_flash_attention import flash_decode
+                from llm_systems.kernels.triton_flash_attention import flash_decode, paged_decode
             except ImportError:
-                flash_decode = None
+                flash_decode = paged_decode = None
             if flash_decode is not None:
                 device = Q.device
-                k_flat = torch.cat([cache.k for _, cache in seqs], dim=1).contiguous()
-                v_flat = torch.cat([cache.v for _, cache in seqs], dim=1).contiguous()
-                lens = [cache.k.size(1) for _, cache in seqs]
-                starts = [0]
-                for length in lens[:-1]:
-                    starts.append(starts[-1] + length)
-                flash_decode(
-                    Q.contiguous(), k_flat, v_flat, out,
-                    torch.tensor([s for s, _ in seqs], device=device, dtype=torch.int32),
-                    torch.tensor(starts, device=device, dtype=torch.int32),
-                    torch.tensor(lens, device=device, dtype=torch.int32),
-                )
+                q_positions = torch.tensor([s for s, _ in seqs], device=device, dtype=torch.int32)
+                seq_lens = torch.tensor([cache.length for _, cache in seqs], device=device, dtype=torch.int32)
+                if hasattr(seqs[0][1], "block_table"):
+                    # Paged: read KV straight from the pool via per-sequence block tables.
+                    pool = seqs[0][1].pool
+                    max_blocks = max(len(cache.block_table) for _, cache in seqs)
+                    block_tables = torch.zeros(len(seqs), max_blocks, device=device, dtype=torch.int32)
+                    for i, (_, cache) in enumerate(seqs):
+                        bt = cache.block_table
+                        block_tables[i, : len(bt)] = torch.tensor(bt, device=device, dtype=torch.int32)
+                    paged_decode(Q.contiguous(), pool.k, pool.v, out,
+                                 q_positions, block_tables, seq_lens, pool.block_size)
+                else:
+                    # Contiguous: concatenate the caches along the key axis.
+                    k_flat = torch.cat([cache.k for _, cache in seqs], dim=1).contiguous()
+                    v_flat = torch.cat([cache.v for _, cache in seqs], dim=1).contiguous()
+                    starts = torch.cumsum(
+                        torch.tensor([0] + [cache.length for _, cache in seqs[:-1]], device=device), 0
+                    ).to(torch.int32)
+                    flash_decode(Q.contiguous(), k_flat, v_flat, out, q_positions, starts, seq_lens)
                 return
 
         for start, cache in seqs:

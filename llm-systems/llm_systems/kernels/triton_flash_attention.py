@@ -209,6 +209,94 @@ def flash_decode(
     )
 
 
+def _paged_decode_configs():
+    return [triton.Config({}, num_warps=w, num_stages=s) for w in (2, 4, 8) for s in (2, 3)]
+
+
+@triton.autotune(configs=_paged_decode_configs(), key=["D"])
+@triton.jit
+def _paged_decode_kernel(
+    Q_ptr, K_pool_ptr, V_pool_ptr, O_ptr,
+    q_pos_ptr, block_tables_ptr, seq_lens_ptr,
+    stride_qh, stride_qt, stride_qd,
+    stride_blk, stride_ph, stride_bs, stride_pd,
+    stride_bt_seq, stride_bt_blk,
+    num_decode,
+    scale,
+    D: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    hs = tl.program_id(0)
+    seq = hs % num_decode
+    head = hs // num_decode
+
+    q_pos = tl.load(q_pos_ptr + seq)
+    seq_len = tl.load(seq_lens_ptr + seq)
+
+    d_range = tl.arange(0, D)
+    q = tl.load(Q_ptr + head * stride_qh + q_pos * stride_qt + d_range * stride_qd).to(tl.float32) * scale
+
+    m_i = -float("inf")
+    l_i = 0.0
+    acc = tl.zeros((D,), dtype=tl.float32)
+    slot = tl.arange(0, BLOCK_SIZE)
+
+    # Walk this sequence's blocks via its block table; a freed-and-reused block
+    # may hold stale tokens past seq_len, so mask by absolute key position.
+    for b in range(tl.cdiv(seq_len, BLOCK_SIZE)):
+        block_id = tl.load(block_tables_ptr + seq * stride_bt_seq + b * stride_bt_blk)
+        base = block_id * stride_blk + head * stride_ph
+        ptrs = base + slot[:, None] * stride_bs + d_range[None, :] * stride_pd
+        k = tl.load(K_pool_ptr + ptrs).to(tl.float32)  # (BLOCK_SIZE, D)
+        v = tl.load(V_pool_ptr + ptrs).to(tl.float32)
+
+        key_pos = b * BLOCK_SIZE + slot
+        s = tl.sum(q[None, :] * k, axis=1)  # (BLOCK_SIZE,)
+        s = tl.where(key_pos < seq_len, s, -float("inf"))
+
+        m_new = tl.maximum(m_i, tl.max(s, axis=0))
+        p = tl.math.exp(s - m_new)
+        alpha = tl.math.exp(m_i - m_new)
+        l_i = l_i * alpha + tl.sum(p, axis=0)
+        acc = acc * alpha + tl.sum(p[:, None] * v, axis=0)
+        m_i = m_new
+
+    acc = acc / l_i
+    tl.store(O_ptr + head * stride_qh + q_pos * stride_qt + d_range * stride_qd, acc.to(O_ptr.dtype.element_ty))
+
+
+def paged_decode(
+    Q: torch.Tensor,
+    K_pool: torch.Tensor,
+    V_pool: torch.Tensor,
+    out: torch.Tensor,
+    q_positions: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_size: int,
+) -> None:
+    """Decode attention reading the KV directly from a paged pool.
+
+    Q, out: (heads, total_tokens, d_head). K_pool, V_pool: (num_blocks, heads,
+    block_size, d_head). q_positions: (num_seqs,) flat-token index per query.
+    block_tables: (num_seqs, max_blocks) physical block ids; seq_lens: (num_seqs,)
+    cache length. One program per (head, seq) walks the sequence's blocks.
+    """
+    heads, _, d = Q.shape
+    num_decode = q_positions.numel()
+    grid = (heads * num_decode,)
+    _paged_decode_kernel[grid](
+        Q, K_pool, V_pool, out,
+        q_positions, block_tables, seq_lens,
+        Q.stride(0), Q.stride(1), Q.stride(2),
+        K_pool.stride(0), K_pool.stride(1), K_pool.stride(2), K_pool.stride(3),
+        block_tables.stride(0), block_tables.stride(1),
+        num_decode,
+        1.0 / (d ** 0.5),
+        D=d, BLOCK_SIZE=block_size,
+    )
+
+
 def flash_prefill_varlen(
     Q: torch.Tensor,
     K: torch.Tensor,
