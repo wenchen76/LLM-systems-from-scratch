@@ -370,6 +370,72 @@ The main comparisons:
   batching) reaches 1044.6 tok/s, compared with 131.2 tok/s for the baseline
   eager + contiguous + static path at batch 64: about **8x** faster.
 
+#### Memory footprint ([bench_memory.py](bench_memory.py))
+
+Environment: A100 40GB PCIe, GPT-3 XL, BF16, `batch` identical full-context
+requests (16-token prompt + 2048 generated, depth 2064), block size 16, run
+concurrently to completion. The paged pool is sized to exactly cover the
+workload, so both backends hold the same KV; `resv` is the allocator's VRAM
+footprint (what triggers OOM), `alloc` is the live KV.
+
+| batch | contiguous resv / alloc GB | paged resv / alloc GB | paged peak |
+|---:|---:|---:|---|
+| 32 | 24.82 / 16.31 | 16.44 / 16.14 | 34% lower |
+| 48 | 39.19 / 23.02 | 22.76 / 22.53 | 42% lower |
+| 64 | 39.32 / 29.73 | 29.25 / 29.01 | 26% lower |
+| 72 | 39.33 / 33.09 | 32.59 / 32.27 | 17% lower |
+| 80 | 39.33 / 36.44 | 35.89 / 35.59 | 9% lower |
+| 88 | OOM | 39.13 / 38.83 | contiguous OOM |
+| 96 | OOM | OOM | — |
+
+The contiguous cache's reserved memory pins near the card's ceiling (~39.3 GB)
+from batch 48 on, while its live KV (`alloc`) stays far lower — at batch 48 the
+gap is 16 GB, lost to `torch.cat` regrowth and the per-step concat of every
+active cache. Paging holds the same KV with `resv ≈ alloc`, since the pool is
+allocated once and written in place. That headroom is the difference between OOM
+and serving: contiguous runs out at batch 88, paging still fits it (39.1 GB), so
+the same 40 GB card sustains ~10% more concurrent full-context sequences and 9–42%
+lower peak at matched batch. (The contiguous cache already grows lazily, so this
+gap is fragmentation plus transients, not over-reservation; against a baseline
+that pre-allocates to max context the gap would be wider.)
+
+#### Custom paged-decode kernel vs FlashInfer / flash-attn ([bench_paged_decode.py](bench_paged_decode.py))
+
+This microbenchmark isolates one single-token decode step over a paged KV cache:
+`batch` sequences, each with `KV len` cached tokens, 16 attention heads, and
+`d_head=128`. It compares this repo's hand-written `paged_decode` Triton kernel
+([triton_flash_attention.py](llm-systems/llm_systems/kernels/triton_flash_attention.py))
+with FlashInfer and flash-attn paged-decode kernels.
+
+Environment: A100 40GB PCIe, BF16, block size 256. Layout conversion is done
+before timing for every backend, and FlashInfer's `plan()` is also hoisted out
+of the timed region, matching a serving setup where KV is already stored in the
+backend's native layout and the decode plan is reused. Outputs match the library
+kernels within BF16 tolerance (max absolute difference around `1e-3`). The ratio
+columns report our throughput relative to each library; values above 1 mean our
+kernel is faster. GB/s is the estimated KV read bandwidth, with percent of the
+A100's 1555 GB/s peak in parentheses.
+
+| batch | KV len | ours GB/s (% peak) | ours ÷ FlashInfer | ours ÷ flash-attn |
+|---:|---:|---:|---:|---:|
+| 1 | 256 | 24 (2%) | 0.36× | 0.33× |
+| 64 | 256 | 1241 (80%) | 1.02× | 1.03× |
+| 256 | 256 | 1335 (86%) | 0.96× | 0.98× |
+| 1 | 1024 | 96 (6%) | 0.42× | 0.34× |
+| 64 | 1024 | 1336 (86%) | 0.94× | 0.96× |
+| 256 | 1024 | 1391 (89%) | 0.94× | 0.97× |
+| 1 | 4096 | 345 (22%) | 0.38× | 0.34× |
+| 64 | 4096 | 1327 (85%) | 0.91× | 0.91× |
+| 256 | 4096 | 1350 (87%) | 0.90× | 0.92× |
+
+At serving batch sizes (`batch >= 64`), the custom kernel reaches 80-89% of peak
+HBM bandwidth and stays within roughly 10% of both libraries. Decode is
+memory-bound at these shapes, so achieved bandwidth is the relevant comparison.
+The gap is much larger at batch 1: one program per `(sequence, head)` leaves too
+little parallelism to fill the GPU, while FlashInfer and flash-attn split work
+across the KV length and run about 2.5-3x
+faster.
+
 ## Quickstart
 
 ### Install

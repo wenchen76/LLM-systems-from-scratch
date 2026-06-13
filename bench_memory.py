@@ -100,7 +100,7 @@ def main():
         pg_str = "OOM" if pg_resv is None else f"{pg_resv:.2f}/{pg_alloc:.2f}"
         note = ""
         if np_resv and pg_resv:  # both fit (and nonzero -> real cuda measurement)
-            note = f"paged {(1 - pg_resv / np_resv) * 100:+.0f}% peak"
+            note = f"paged {(1 - pg_resv / np_resv) * 100:.0f}% lower peak"
             last_common = (batch, np_resv, pg_resv)
         elif np_resv is None and pg_resv is not None:
             note = "contiguous OOM, paged still fits"
