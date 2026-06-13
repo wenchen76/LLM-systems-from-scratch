@@ -1,17 +1,21 @@
-"""Microbenchmark: our paged_decode Triton kernel vs flash-attn's flash_attn_with_kvcache.
+"""Microbenchmark: our paged_decode Triton kernel vs FlashInfer (and flash-attn).
 
 Isolates a single decode step -- R sequences, each with L cached KV tokens in a
 paged pool, one query token each -- and compares latency, achieved HBM bandwidth,
-and (with --peak-bw) % of peak. Both kernels read the same logical KV from a block
-pool via per-sequence block tables; correctness is asserted before timing.
+and (with --peak-bw) % of peak against off-the-shelf paged-decode kernels. Every
+backend reads the same logical KV from a block pool; correctness is asserted
+against ours before timing.
 
-Decode is memory-bound: the floor is reading every KV byte once, so achieved
-bandwidth is the fair cross-shape metric. Our kernel runs one program per
-(head, seq) with no split-K, so it should track flash-attn at large R*heads and
-fall behind at small batch / long context, where flash-decoding's split-K along
-the KV length is what keeps the SMs busy.
+FlashInfer is the main baseline -- purpose-built for paged decode, with split-K
+(flash-decoding) along the KV length. Our kernel runs one program per (head, seq)
+with no split-K, so it should track FlashInfer at large R*heads and fall behind at
+small batch / long context, where keeping the SMs busy needs the KV-length split.
+Decode is memory-bound, so achieved bandwidth is the fair cross-shape metric.
 
-    python bench_paged_decode.py --heads 16 --d-head 128 --block-size 256 \
+flash-attn's flash_attn_with_kvcache is included too but needs a prebuilt wheel
+matching the local torch; its column shows "-" (or "err") when unavailable.
+
+    python bench_paged_decode.py --heads 16 --d-head 128 --block-size 16 \
         --batches 1 8 64 --lengths 256 1024 4096 --peak-bw 1935
 """
 import argparse
@@ -24,6 +28,11 @@ try:
     from flash_attn import flash_attn_with_kvcache
 except ImportError:
     flash_attn_with_kvcache = None
+
+try:
+    import flashinfer
+except ImportError:
+    flashinfer = None
 
 
 def build_pool(R, L, H, D, block_size, device, dtype):
@@ -55,6 +64,32 @@ def run_flash_attn(q, k_pool, v_pool, block_tables, seq_lens):
     o = flash_attn_with_kvcache(q_bshd, k_cache, v_cache,
                                 cache_seqlens=seq_lens, block_table=block_tables, causal=False)
     return o.squeeze(1).transpose(0, 1)                        # (H, R, D)
+
+
+def make_flashinfer(q, k_pool, v_pool, block_tables, L, block_size, workspace, dtype):
+    """Build and plan a FlashInfer paged-decode wrapper, then return a callable that
+    runs one decode step. plan() (scheduling) is done here, outside timing; only the
+    returned run() is timed, matching a server that plans once per shape and runs each
+    step. FlashInfer wants the cache in NHD page layout (num_pages, page_size, heads,
+    dim) and the block table as CSR (page_indptr / page_indices / last_page_len)."""
+    H, R, D = q.shape
+    bps = (L + block_size - 1) // block_size
+    k_cache = k_pool.permute(0, 2, 1, 3).contiguous()          # (num_pages, page_size, H, D)
+    v_cache = v_pool.permute(0, 2, 1, 3).contiguous()
+    device = q.device
+    page_indptr = torch.arange(0, (R + 1) * bps, bps, device=device, dtype=torch.int32)
+    page_indices = block_tables.reshape(-1).to(torch.int32)
+    last_page_len = torch.full((R,), (L - 1) % block_size + 1, device=device, dtype=torch.int32)
+
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(workspace, "NHD")
+    wrapper.plan(page_indptr, page_indices, last_page_len, H, H, D, block_size,
+                 pos_encoding_mode="NONE", q_data_type=dtype, kv_data_type=dtype)
+
+    def run():
+        qr = q.transpose(0, 1).contiguous()                    # (R, H, D)
+        o = wrapper.run(qr, (k_cache, v_cache))                # (R, H, D)
+        return o.transpose(0, 1)                               # (H, R, D)
+    return run
 
 
 def time_fn(fn, iters, warmup):
@@ -89,13 +124,14 @@ def main():
     dtype = getattr(torch, args.dtype)
     bytes_per = torch.empty((), dtype=dtype).element_size()
     H, D = args.heads, args.d_head
-    have_fa = flash_attn_with_kvcache is not None
+    have_fi, have_fa = flashinfer is not None, flash_attn_with_kvcache is not None
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=args.device) if have_fi else None
     print(f"device={args.device} dtype={args.dtype} heads={H} d_head={D} block_size={args.block_size} "
-          f"flash_attn={'yes' if have_fa else 'MISSING'}")
-    bw_hdr = "GB/s" + (" (%pk)" if args.peak_bw else "")
-    print(f"{'batch':>5} {'len':>6} | {'ours ms':>9} {bw_hdr:>12} | {'flash ms':>9} {bw_hdr:>12} | "
-          f"{'ours/flash':>10} {'max|Δ|':>8}")
-    print("-" * 88)
+          f"flashinfer={'yes' if have_fi else 'MISSING'} flash_attn={'yes' if have_fa else 'MISSING'}")
+    bwh = "GB/s" + (" %pk" if args.peak_bw else "")
+    print(f"{'batch':>5} {'len':>6} | {'ours ms':>8} {bwh:>10} | {'fi ms':>8} {'x':>5} | "
+          f"{'fa ms':>8} {'x':>5} | {'max|Δ|':>8}")
+    print("-" * 84)
 
     for L in args.lengths:
         for R in args.batches:
@@ -111,21 +147,30 @@ def main():
             t_ours = time_fn(lambda: run_ours(q, k_pool, v_pool, block_tables, seq_lens, args.block_size),
                              args.iters, args.warmup)
 
-            fa_ms, ratio, diff = "-", "-", "-"
+            diff = 0.0
+            fi_ms, fi_x = "-", "-"
+            if have_fi:
+                try:
+                    fi_run = make_flashinfer(q, k_pool, v_pool, block_tables, L, args.block_size, workspace, dtype)
+                    diff = max(diff, (out_ours - fi_run()).abs().max().item())
+                    t_fi = time_fn(fi_run, args.iters, args.warmup)
+                    fi_ms, fi_x = f"{t_fi:.3f}", f"{t_fi / t_ours:.2f}"
+                except Exception as e:  # API / layout mismatches surface here, not as a crash
+                    fi_ms, fi_x = "err", str(e)[:5]
+
+            fa_ms, fa_x = "-", "-"
             if have_fa:
                 try:
                     out_fa = run_flash_attn(q, k_pool, v_pool, block_tables, seq_lens)
-                    diff = f"{(out_ours - out_fa).abs().max().item():.1e}"
+                    diff = max(diff, (out_ours - out_fa).abs().max().item())
                     t_fa = time_fn(lambda: run_flash_attn(q, k_pool, v_pool, block_tables, seq_lens),
                                    args.iters, args.warmup)
-                    fa_ms, ratio = f"{t_fa:.3f}", f"{t_fa / t_ours:.2f}x"
-                    fa_bw = bw(t_fa)
-                except Exception as e:  # layout / page-size constraints surface here, not as a crash
-                    fa_ms, fa_bw, ratio, diff = "err", str(e)[:24], "-", "-"
-            else:
-                fa_bw = "-"
-            print(f"{R:>5} {L:>6} | {t_ours:>9.3f} {bw(t_ours):>12} | {fa_ms:>9} {fa_bw:>12} | "
-                  f"{ratio:>10} {diff:>8}")
+                    fa_ms, fa_x = f"{t_fa:.3f}", f"{t_fa / t_ours:.2f}"
+                except Exception as e:
+                    fa_ms, fa_x = "err", str(e)[:5]
+
+            print(f"{R:>5} {L:>6} | {t_ours:>8.3f} {bw(t_ours):>10} | {fi_ms:>8} {fi_x:>5} | "
+                  f"{fa_ms:>8} {fa_x:>5} | {diff:>8.1e}")
 
 
 if __name__ == "__main__":
