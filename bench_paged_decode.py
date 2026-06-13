@@ -55,15 +55,20 @@ def run_ours(q, k_pool, v_pool, block_tables, seq_lens, block_size):
     return out
 
 
-def run_flash_attn(q, k_pool, v_pool, block_tables, seq_lens):
-    """Same logical attention through flash_attn_with_kvcache; returns (heads, R, d_head)."""
-    H, R, D = q.shape
-    q_bshd = q.transpose(0, 1).unsqueeze(1).contiguous()       # (R, 1, H, D)
+def make_flash_attn(q, k_pool, v_pool, block_tables, seq_lens):
+    """Build a flash_attn_with_kvcache runner with the cache pre-converted to its
+    paged layout (num_blocks, page_size, heads, dim) outside the timed region, so
+    only the attention -- not a per-call multi-GB pool copy -- is measured (a server
+    stores the cache in this layout to begin with). Returns run() -> (heads, R, d_head)."""
     k_cache = k_pool.permute(0, 2, 1, 3).contiguous()          # (num_blocks, block_size, H, D)
     v_cache = v_pool.permute(0, 2, 1, 3).contiguous()
-    o = flash_attn_with_kvcache(q_bshd, k_cache, v_cache,
-                                cache_seqlens=seq_lens, block_table=block_tables, causal=False)
-    return o.squeeze(1).transpose(0, 1)                        # (H, R, D)
+
+    def run():
+        q_bshd = q.transpose(0, 1).unsqueeze(1).contiguous()   # (R, 1, H, D)
+        o = flash_attn_with_kvcache(q_bshd, k_cache, v_cache,
+                                    cache_seqlens=seq_lens, block_table=block_tables, causal=False)
+        return o.squeeze(1).transpose(0, 1)                    # (H, R, D)
+    return run
 
 
 def make_flashinfer(q, k_pool, v_pool, block_tables, L, block_size, workspace, dtype):
@@ -161,10 +166,9 @@ def main():
             fa_ms, fa_x = "-", "-"
             if have_fa:
                 try:
-                    out_fa = run_flash_attn(q, k_pool, v_pool, block_tables, seq_lens)
-                    diff = max(diff, (out_ours - out_fa).abs().max().item())
-                    t_fa = time_fn(lambda: run_flash_attn(q, k_pool, v_pool, block_tables, seq_lens),
-                                   args.iters, args.warmup)
+                    fa_run = make_flash_attn(q, k_pool, v_pool, block_tables, seq_lens)
+                    diff = max(diff, (out_ours - fa_run()).abs().max().item())
+                    t_fa = time_fn(fa_run, args.iters, args.warmup)
                     fa_ms, fa_x = f"{t_fa:.3f}", f"{t_fa / t_ours:.2f}"
                 except Exception as e:
                     fa_ms, fa_x = "err", str(e)[:5]
