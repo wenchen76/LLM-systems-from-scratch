@@ -1,0 +1,50 @@
+# TinyLlama-1.1B dimensions — a real, open Llama-architecture model close to
+# GPT-3 XL scale (hidden 2048, MHA, ~1.1B params). Transcribed from the released
+# config.json of TinyLlama/TinyLlama-1.1B.
+#
+# Used for the bench_memory.py --hf baseline: both our TransformerLM and the
+# Hugging Face LlamaForCausalLM built by build_hf_model instantiate from this
+# `model` block, so per-token KV and parameter counts match and the only thing
+# the benchmark varies is the cache implementation (ours vs HF DynamicCache).
+#
+#   uv run python bench_memory.py --config configures/tinyllama_1b.yaml --device cuda \
+#       --dtype bfloat16 --max-tokens 2048 --prompt-len 16 \
+#       --batches 32 48 64 72 80 88 96 112 --hf
+#
+# These dims map one-to-one onto LlamaConfig (RoPE + SwiGLU, RMSNorm, MHA):
+#   d_model -> hidden_size, d_ff -> intermediate_size, num_heads ->
+#   num_attention_heads (= num_key_value_heads, MHA), num_layers ->
+#   num_hidden_layers, context_length -> max_position_embeddings.
+# Differs from gpt3xl.yaml only in vocab (32000 vs 50257), layers (22 vs 24),
+# heads (32, d_head=64, vs 16/d_head=128 — same total KV/token), d_ff (5632).
+
+model:
+  vocab_size: 32000
+  context_length: 2048
+  d_model: 2048
+  num_layers: 22
+  num_heads: 32           # 2048 / 32 -> d_head=64; num_key_value_heads = num_heads (MHA)
+  d_ff: 5632
+  rope_theta: 10000.0
+
+training:
+  device: "auto"
+  batch_size: 4
+  max_steps: 500
+  val_interval: 50
+  gpu_log_interval: 10
+  checkpoint_dir: "checkpoints/tinyllama_1b"
+  wandb: false
+  wandb_project: "tinyllama-1b-owt"
+
+optimizer:
+  learning_rate_max: 2.0e-4
+  learning_rate_min: 2.0e-5
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  warmup_steps: 2000
+  decay_steps: 300000
+
+dataset:
+  train_path: "data/owt_train.bin"
+  val_path: "data/owt_val.bin"

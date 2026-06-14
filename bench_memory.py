@@ -12,8 +12,14 @@ in place. The payoff of paging is that a fixed VRAM budget then sustains more
 concurrency (or, fixing --batch and raising --max-tokens, longer context) before
 OOM. Perf is weight-independent, so a random-init model is used.
 
+Pass --hf to also sweep a same-dimensioned Hugging Face Llama (its dynamic /
+contiguous KV cache) under the same static batch, as a standard-framework
+reference. It runs as a second phase after our model is freed, so the two models'
+weights never reside at once; the architecture/dims and workload match, only the
+model code and cache implementation differ.
+
     python bench_memory.py --config configures/gpt3xl.yaml --device cuda \
-        --dtype bfloat16 --max-tokens 256 --batches 16 32 64 96 128 192
+        --dtype bfloat16 --max-tokens 256 --batches 16 32 64 96 128 192 --hf
 """
 import argparse
 
@@ -64,6 +70,46 @@ def run_once(model, batch, prompt_len, gen_len, device, paged, block_size):
             torch.cuda.empty_cache()
 
 
+def build_hf_model(cfg, device, dtype):
+    """A Hugging Face Llama with the same dims as our model (RoPE + SwiGLU, MHA), so
+    per-token KV and weights match; only the model code and cache implementation differ."""
+    from transformers import LlamaConfig, LlamaForCausalLM
+    hf_cfg = LlamaConfig(
+        vocab_size=cfg["vocab_size"], hidden_size=cfg["d_model"], intermediate_size=cfg["d_ff"],
+        num_hidden_layers=cfg["num_layers"], num_attention_heads=cfg["num_heads"],
+        num_key_value_heads=cfg["num_heads"], max_position_embeddings=cfg["context_length"],
+        rope_theta=cfg.get("rope_theta", 10000.0),
+    )
+    return LlamaForCausalLM(hf_cfg).to(device=device, dtype=dtype).eval()
+
+
+def run_hf(model_hf, batch, prompt_len, gen_len, device):
+    """Static-batch generate gen_len tokens for `batch` identical sequences with HF's
+    default (dynamic / contiguous) KV cache. Returns peak (reserved, allocated) GB, or
+    (None, None) on OOM."""
+    if device == "cuda":
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+    input_ids = torch.ones(batch, prompt_len, dtype=torch.long, device=device)
+    attn = torch.ones_like(input_ids)
+    try:
+        with torch.no_grad():
+            model_hf.generate(input_ids, attention_mask=attn, do_sample=False, num_beams=1,
+                              min_new_tokens=gen_len, max_new_tokens=gen_len, use_cache=True,
+                              pad_token_id=0)
+        if device != "cuda":
+            return 0.0, 0.0
+        torch.cuda.synchronize()
+        return torch.cuda.max_memory_reserved() / 1e9, torch.cuda.max_memory_allocated() / 1e9
+    except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+        if "out of memory" not in str(e).lower():
+            raise
+        return None, None
+    finally:
+        if device == "cuda":
+            torch.cuda.empty_cache()
+
+
 def main():
     parser = argparse.ArgumentParser(description="Paged vs contiguous KV memory benchmark")
     parser.add_argument("--config", type=str, default=None,
@@ -76,6 +122,8 @@ def main():
     parser.add_argument("--batches", type=int, nargs="+", default=[16, 32, 64, 96, 128],
                         help="Concurrency levels to sweep (stops once both backends OOM)")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--hf", action="store_true",
+                        help="Also sweep a same-dims Hugging Face Llama (static batch, dynamic/contiguous KV)")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -118,6 +166,30 @@ def main():
         b, npk, pgk = last_common
         print(f"at batch {b} (both fit): paged peak {pgk:.2f} GB vs contiguous {npk:.2f} GB "
               f"({(1 - pgk / npk) * 100:.0f}% lower).")
+
+    if args.hf:
+        del model  # free our model's weights before building HF's so they never coexist
+        if args.device == "cuda":
+            torch.cuda.empty_cache()
+        try:
+            model_hf = build_hf_model(cfg, args.device, dtype)
+        except ImportError:
+            print("\ntransformers not installed; skipping --hf (uv pip install transformers)")
+            return
+        hf_w = sum(p.numel() * p.element_size() for p in model_hf.parameters()) / 1e9
+        print(f"\nHugging Face Llama (same dims, static batch, dynamic/contiguous KV)  weights={hf_w:.2f}GB")
+        print(f"{'batch':>6} | {'HF resv/alloc GB':>22}")
+        print("-" * 33)
+        hf_max = None
+        for batch in args.batches:
+            hf_resv, hf_alloc = run_hf(model_hf, batch, args.prompt_len, args.max_tokens, args.device)
+            hf_str = "OOM" if hf_resv is None else f"{hf_resv:.2f}/{hf_alloc:.2f}"
+            print(f"{batch:>6} | {hf_str:>22}")
+            if hf_resv is None:
+                break
+            hf_max = batch
+        print("-" * 33)
+        print(f"HF sustained up to batch {hf_max}; our paged up to batch {pg_max}.")
 
 
 if __name__ == "__main__":
