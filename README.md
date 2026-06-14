@@ -372,34 +372,59 @@ The main comparisons:
 
 #### Memory footprint ([bench_memory.py](bench_memory.py))
 
-Environment: A100 40GB PCIe, GPT-3 XL, BF16, `batch` identical full-context
-requests (16-token prompt + 2048 generated, depth 2064), block size 16, run
-concurrently to completion. The paged pool is sized to exactly cover the
-workload, so both backends hold the same KV; `resv` is the allocator's VRAM
-footprint (what triggers OOM), `alloc` is the live KV.
+Environment: A100 40GB PCIe, BF16, and
+[TinyLlama-1.1B](configures/tinyllama_1b.yaml)-sized Llama dimensions: hidden
+2048, 22 layers, MHA. The workload is a fixed concurrent load, not a
+continuous-arrival trace: `batch` identical requests start together from a
+16-token prompt and decode until the 2K context window is full.
 
-| batch | contiguous resv / alloc GB | paged resv / alloc GB | paged peak |
-|---:|---:|---:|---|
-| 32 | 24.82 / 16.31 | 16.44 / 16.14 | 34% lower |
-| 48 | 39.19 / 23.02 | 22.76 / 22.53 | 42% lower |
-| 64 | 39.32 / 29.73 | 29.25 / 29.01 | 26% lower |
-| 72 | 39.33 / 33.09 | 32.59 / 32.27 | 17% lower |
-| 80 | 39.33 / 36.44 | 35.89 / 35.59 | 9% lower |
-| 88 | OOM | 39.13 / 38.83 | contiguous OOM |
-| 96 | OOM | OOM | — |
+`resv` is peak VRAM reserved by the PyTorch CUDA allocator, the number that
+eventually causes OOM. `alloc` is peak allocated VRAM, including model weights,
+KV cache, and runtime tensors. The table compares three runs on the same shape
+and workload: this repo's contiguous `KVCache`, this repo's paged KV pool, and a
+same-dimensioned Hugging Face `LlamaForCausalLM` using its default dynamic
+contiguous KV cache. The HF run is measured in a separate phase after this
+repo's model is freed, so the two sets of weights never coexist.
 
-The contiguous cache's reserved memory pins near the card's ceiling (~39.3 GB)
-from batch 48 on, while its live KV (`alloc`) stays far lower — at batch 48 the
-gap is 16 GB, lost to `torch.cat` regrowth and the per-step concat of every
-active cache. Paging holds the same KV with `resv ≈ alloc`, since the pool is
-allocated once and written in place. That headroom is the difference between OOM
-and serving: contiguous runs out at batch 88, paging still fits it (39.1 GB), so
-the same 40 GB card sustains ~10% more concurrent full-context sequences and 9–42%
-lower peak at matched batch. (The contiguous cache already grows lazily, so this
-gap is fragmentation plus transients, not over-reservation; against a baseline
-that pre-allocates to max context the gap would be wider.)
+| batch | contiguous resv / alloc GB | paged resv / alloc GB | HF Llama resv / alloc GB |
+|---:|---:|---:|---:|
+| 32 | 23.77 / 14.88 | 14.96 / 14.71 | 40.71 / 14.72 |
+| 48 | 40.66 / 21.06 | 20.71 / 20.51 | 40.72 / 20.80 |
+| 64 | 40.67 / 27.23 | 26.64 / 26.44 | 40.71 / 26.90 |
+| 72 | 40.72 / 30.32 | 29.74 / 29.42 | 40.72 / 29.94 |
+| 80 | 40.68 / 33.41 | 32.71 / 32.46 | 40.72 / 32.98 |
+| 88 | 40.71 / 36.49 | 35.67 / 35.42 | 40.72 / 36.06 |
+| 96 | OOM | 38.65 / 38.39 | OOM |
 
-#### Custom paged-decode kernel vs FlashInfer / flash-attn ([bench_paged_decode.py](bench_paged_decode.py))
+Because the model dimensions and request trace are matched, all three runs carry
+nearly the same live workload at a given batch size. The difference is allocator
+pressure: the paged pool keeps `resv` close to `alloc` because it is allocated
+once and written in place, while the dynamic contiguous paths drive reserved
+memory toward the 40 GB card ceiling through cache growth, fragmentation, and
+per-step transient buffers. At batch 88, paging uses 35.67 GB reserved versus
+40.71 GB for the contiguous path and 40.72 GB for HF. At batch 96, both
+contiguous baselines OOM while the paged pool still fits at 38.65 GB, sustaining
+about **9% more concurrent 2K-context requests** on the same GPU. The HF reference
+is not an apples-to-apples serving-engine baseline, but it shows that this
+allocator pressure is representative of dynamic contiguous KV caches rather than
+an artifact of this repo's baseline.
+
+## Fused attention kernels ([triton_flash_attention.py](llm-systems/llm_systems/kernels/triton_flash_attention.py))
+
+The continuous-batching engine's CUDA attention runs through two hand-written
+Triton kernels, split by regime because prefill and decode parallelize
+differently:
+
+- **Varlen prefill** (`flash_prefill_varlen`) — FlashAttention-2 over a flat batch
+  of ragged sequences in a single launch: one program per (query tile, head,
+  sequence), with causal masking and online softmax.
+- **Decode** (`flash_decode` / `paged_decode`) — single-query (`q_len=1`) attention
+  over each sequence's cached history, one program per (head, sequence) streaming
+  the KV with online softmax. `flash_decode` reads a contiguous concatenated cache;
+  `paged_decode` reads straight from the paged block pool via the per-request block
+  table.
+
+### Benchmark: paged-decode kernel vs FlashInfer / flash-attn ([bench_paged_decode.py](bench_paged_decode.py))
 
 This microbenchmark isolates one single-token decode step over a paged KV cache:
 `batch` sequences, each with `KV len` cached tokens, 16 attention heads, and
