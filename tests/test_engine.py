@@ -65,37 +65,61 @@ def test_paged_engine_greedy_matches_sequential():
     assert all(pool.num_free == pool.num_blocks for pool in engine.pools)  # no block leak
 
 
-def test_paged_static_decode_matches_sequential():
-    """The loop-free forward_decode path (static_decode=True) must produce the same tokens
-    as sequential generation — it validates the prebuilt decode metadata and forward_decode
-    (here through its eager fallback; the CUDA path is the same code with paged_decode)."""
-    model = make_model()
-    prompts = make_prompts([5, 12, 3, 8], SMALL_CONFIG["vocab_size"])
-    sp = SamplingParams(max_tokens=20, top_k=1)
+def decode_inputs(engine, batch):
+    """Build the fixed-batch tensors model.forward_decode expects from `batch`'s paged caches,
+    growing each layer's block table for the new token (what the CUDA-graph path fills in place)."""
+    bs, dev = engine.block_size, engine.device
+    lengths = [r.kv_caches[0].length for r in batch]
+    token_ids = torch.tensor([r.output_ids[-1] for r in batch], dtype=torch.long, device=dev)
+    positions = torch.tensor(lengths, dtype=torch.long, device=dev)
+    seq_lens = torch.tensor([L + 1 for L in lengths], dtype=torch.int32, device=dev)
+    q_positions = torch.arange(len(batch), dtype=torch.int32, device=dev)
+    max_blocks = engine.pools[0].max_seq_blocks or max(L // bs + 1 for L in lengths)
+    block_tables, phys, offset = [], [], []
+    for layer, pool in enumerate(engine.pools):
+        bt = torch.zeros(len(batch), max_blocks, dtype=torch.int32, device=dev)
+        ph = torch.empty(len(batch), dtype=torch.long, device=dev)
+        of = torch.empty(len(batch), dtype=torch.long, device=dev)
+        for i, req in enumerate(batch):
+            cache = req.kv_caches[layer]
+            L = cache.length
+            if L // bs >= len(cache.block_table):
+                cache.block_table.append(pool.allocate())
+            bt[i, : len(cache.block_table)] = torch.tensor(cache.block_table, dtype=torch.int32, device=dev)
+            ph[i] = cache.block_table[L // bs]
+            of[i] = L % bs
+        block_tables.append(bt)
+        phys.append(ph)
+        offset.append(of)
+    return token_ids, positions, block_tables, phys, offset, seq_lens, q_positions
 
-    engine = LLMEngine(model, device="cpu", paged=True, static_decode=True, block_size=4, num_blocks=512)
-    outputs = engine.generate(prompts, sp)
 
-    for prompt, out in zip(prompts, outputs):
-        assert out == greedy_reference(model, prompt, 20)
-    assert all(pool.num_free == pool.num_blocks for pool in engine.pools)  # no block leak
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="forward_decode runs the CUDA paged_decode kernel")
+def test_forward_decode_matches_varlen():
+    """The loop-free forward_decode (the forward that gets CUDA-graph captured) must compute
+    the same decode logits as the forward_varlen decode path for the same paged caches. Two
+    identically-prefilled engines run one decode step each, one via each path."""
+    model = make_model().to("cuda")
+    for module in model.modules():  # so the forward_varlen decode path also uses paged_decode
+        if hasattr(module, "use_flash_attn"):
+            module.use_flash_attn = True
+    prompts = make_prompts([5, 7, 4], SMALL_CONFIG["vocab_size"])
+    sp = SamplingParams(max_tokens=10, top_k=1)
 
+    def prefilled_engine():
+        e = LLMEngine(model, device="cuda", paged=True, block_size=4, num_blocks=64)
+        for p in prompts:
+            e.add_request(p, sp)
+        e.step()  # admit + prefill; every request is now one token into decode
+        return e
 
-def test_paged_pad_decode_matches_sequential():
-    """Fixed-shape decode (pad_decode=True): padding a decode batch up to a bucket
-    size with throwaway dummy requests must not change any real request's output —
-    greedy stays byte-for-byte equal to sequential generation — and the dummies must
-    actually be exercised."""
-    model = make_model()
-    prompts = make_prompts([5, 9, 4, 7, 6], SMALL_CONFIG["vocab_size"])  # 5 running -> pad to bucket 8
-    sp = SamplingParams(max_tokens=18, top_k=1)
+    e_fd, e_fv = prefilled_engine(), prefilled_engine()
+    ins = decode_inputs(e_fd, e_fd.running)
+    logits_fd = model.forward_decode(ins[0], ins[1], e_fd.pools, *ins[2:])     # (R, vocab)
+    flat, cu, pos, caches, last_idx = e_fv._build_batch()
+    logits_fv = model.forward_varlen(flat, cu, pos, request_kv_caches=caches)[last_idx]
 
-    engine = LLMEngine(model, device="cpu", paged=True, pad_decode=True, block_size=4, num_blocks=512)
-    outputs = engine.generate(prompts, sp)
-
-    for prompt, out in zip(prompts, outputs):
-        assert out == greedy_reference(model, prompt, 18)
-    assert engine._dummies, "padding never triggered — test would be vacuous"
+    assert torch.allclose(logits_fd, logits_fv, atol=1e-3)
 
 
 def test_paged_admission_control_queues_when_blocks_scarce():

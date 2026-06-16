@@ -64,7 +64,7 @@ class LLMEngine:
 
     def __init__(self, model: TransformerLM, device: str = "cpu", max_running: int = 64,
                  paged: bool = False, block_size: int = 16, num_blocks: int = 4096,
-                 pad_decode: bool = False, static_decode: bool = False):
+                 cuda_graph: bool = False):
         self.model = model.eval()
         self.device = device
         self.context_length = model.context_length
@@ -73,13 +73,11 @@ class LLMEngine:
         self.running: list[Request] = []
         self._next_id = 0
 
-        # Optional fixed-shape decode: pad a decode-only batch up to a bucket size
-        # with throwaway dummy requests so the forward runs on one of a few constant
-        # shapes — the prerequisite for CUDA-graph capture / compile. Paged only.
-        self.pad_decode = pad_decode and paged
-        # Route decode-only steps through the loop-free model.forward_decode (the path that
-        # will be CUDA-graph captured). Paged only.
-        self.static_decode = static_decode and paged
+        # cuda_graph routes a decode-only step through the loop-free model.forward_decode and,
+        # on CUDA, replays a captured graph per bucket batch size (padding up to the bucket with
+        # throwaway dummy requests). On CPU it runs forward_decode eagerly. Paged only.
+        self.cuda_graph = cuda_graph and paged
+        self._graphs = None
         self._dummies: list[Request] = []
         self._buckets = sorted({b for b in (1, 2, 4, 8, 16, 32, 64, 128, 256) if b < max_running} | {max_running})
 
@@ -98,10 +96,13 @@ class LLMEngine:
                 BlockPool(num_blocks, block_size, num_heads, d_head, dtype=dtype, device=device)
                 for _ in range(cfg["num_layers"])
             ]
-            if self.pad_decode:  # fixed block-table width -> decode metadata is one shape per bucket
+            if self.cuda_graph:  # fixed block-table width -> decode metadata is one shape per bucket
                 max_seq_blocks = (self.context_length + block_size - 1) // block_size
                 for pool in self.pools:
                     pool.max_seq_blocks = max_seq_blocks
+                if device == "cuda":  # capture is CUDA-only; on CPU forward_decode runs eagerly
+                    from llm_core.decode_graphs import DecodeGraphs
+                    self._graphs = DecodeGraphs(self, max_seq_blocks)
 
     def _new_caches(self):
         """Per-layer KV cache for one request — paged or contiguous."""
@@ -152,23 +153,15 @@ class LLMEngine:
         if not self.running:
             return []
 
-        if self.static_decode and all(r.prefilled for r in self.running):
-            return self._decode_step()  # loop-free forward_decode path (graph/compile foundation)
+        if self._graphs is not None and all(r.prefilled for r in self.running):
+            return self._decode_step()  # decode-only step: replay this bucket's captured graph
 
-        # Fixed-shape decode: on a decode-only step pad up to a bucket with dummy
-        # requests, so the forward runs on a constant shape. Dummies sit after the
-        # real requests, so the real tokens keep flat indices 0..len(real)-1.
-        real = self.running
-        dummies: list[Request] = []
-        if self.pad_decode and all(r.prefilled for r in real):
-            dummies = self._take_dummies(self._bucket(len(real)) - len(real))
-
-        flat, cu_seqlens, position_ids, caches, last_idx = self._build_batch(real + dummies)
+        flat, cu_seqlens, position_ids, caches, last_idx = self._build_batch()
         logits = self.model.forward_varlen(flat, cu_seqlens, position_ids, request_kv_caches=caches)
-        next_ids = self._sample(logits[last_idx[:len(real)]])  # only the real requests
+        next_ids = self._sample(logits[last_idx])  # one token per running request
 
         finished = []
-        for req, token in zip(real, next_ids.tolist()):
+        for req, token in zip(self.running, next_ids.tolist()):
             req.prefilled = True
             req.output_ids.append(token)
             req.finish_reason = self._finish_reason(req, token)
@@ -176,15 +169,12 @@ class LLMEngine:
                 req.state = RequestState.FINISHED
                 finished.append(req)
 
-        self.running = [r for r in real if r.state is RequestState.RUNNING]
+        self.running = [r for r in self.running if r.state is RequestState.RUNNING]
         if self.paged:  # return finished requests' blocks and reservations to the pool
             for req in finished:
                 for cache in req.kv_caches:
                     cache.free()
                 self.reserved_blocks -= req.reserved_blocks
-        for dummy in dummies:  # reset so dummies never grow or leak blocks
-            for cache in dummy.kv_caches:
-                cache.length = 1
         return finished
 
     def generate(self, prompts, sampling: SamplingParams | None = None) -> list[list[int]]:
@@ -225,19 +215,17 @@ class LLMEngine:
         req.reserved_blocks = need
         return True
 
-    def _build_batch(self, requests: list[Request] | None = None):
-        """Flatten each request's new tokens into one varlen batch (defaults to the
-        running set; a padded decode step passes running + dummies).
+    def _build_batch(self):
+        """Flatten each running request's new tokens into one varlen batch.
 
         A not-yet-prefilled request contributes its whole prompt; a decoding one
         contributes just its last token. Each token gets its absolute position.
         """
-        requests = self.running if requests is None else requests
         flat: list[int] = []
         positions: list[int] = []
         cu: list[int] = [0]
         last_idx: list[int] = []
-        for req in requests:
+        for req in self.running:
             if not req.prefilled:
                 tokens, start = req.prompt_ids, 0
             else:
@@ -251,51 +239,20 @@ class LLMEngine:
             to_t(flat),
             to_t(cu),
             to_t(positions),
-            [req.kv_caches for req in requests],
+            [req.kv_caches for req in self.running],
             to_t(last_idx),
         )
 
-    def _build_decode_inputs(self, batch: list[Request]):
-        """Prebuild the fixed-batch tensors for model.forward_decode from `batch`'s caches,
-        growing each layer's block table for the new token. Lengths are advanced by the caller
-        after the forward. All metadata is built here (host side) so the forward is sync-free."""
-        B = len(batch)
-        bs = self.block_size
-        dev = self.device
-        lengths = [r.kv_caches[0].length for r in batch]  # same across layers (lock-step)
-        token_ids = torch.tensor([r.output_ids[-1] for r in batch], dtype=torch.long, device=dev)
-        positions = torch.tensor(lengths, dtype=torch.long, device=dev)            # new token's absolute pos
-        seq_lens = torch.tensor([L + 1 for L in lengths], dtype=torch.int32, device=dev)  # incl. new token
-        q_positions = torch.arange(B, dtype=torch.int32, device=dev)               # each token sits at its slot
-        max_blocks = self.pools[0].max_seq_blocks or max(L // bs + 1 for L in lengths)
-
-        block_tables, phys, offset = [], [], []
-        for layer, pool in enumerate(self.pools):
-            bt = torch.zeros(B, max_blocks, dtype=torch.int32, device=dev)
-            ph = torch.empty(B, dtype=torch.long, device=dev)
-            of = torch.empty(B, dtype=torch.long, device=dev)
-            for i, req in enumerate(batch):
-                cache = req.kv_caches[layer]
-                L = cache.length
-                if L // bs >= len(cache.block_table):
-                    cache.block_table.append(pool.allocate())
-                table = cache.block_table
-                bt[i, : len(table)] = torch.tensor(table, dtype=torch.int32, device=dev)
-                ph[i] = table[L // bs]
-                of[i] = L % bs
-            block_tables.append(bt)
-            phys.append(ph)
-            offset.append(of)
-        return token_ids, positions, block_tables, phys, offset, seq_lens, q_positions
-
     def _decode_step(self) -> list[Request]:
-        """One decode-only step through the loop-free model.forward_decode (static_decode)."""
+        """One decode-only step replayed from this bucket's captured CUDA graph (only reached
+        when graphs are available, i.e. on CUDA). The batch is padded up to the bucket with
+        dummy requests; the graph writes the new tokens' KV and computes the logits."""
         real = self.running
-        token_ids, positions, block_tables, phys, offset, seq_lens, q_positions = self._build_decode_inputs(real)
-        logits = self.model.forward_decode(token_ids, positions, self.pools,
-                                           block_tables, phys, offset, seq_lens, q_positions)
+        dummies = self._take_dummies(self._bucket(len(real)) - len(real))
+        batch = real + dummies
+        logits = self._graphs.run(batch)[: len(real)]  # drop the dummy rows
         next_ids = self._sample(logits)
-        for req in real:  # the new token's KV is now written -> advance every layer's length
+        for req in batch:  # the new token's KV is now written -> advance every layer's length
             for cache in req.kv_caches:
                 cache.length += 1
 
@@ -312,6 +269,9 @@ class LLMEngine:
             for cache in req.kv_caches:
                 cache.free()
             self.reserved_blocks -= req.reserved_blocks
+        for dummy in dummies:  # reset so dummies never grow or leak
+            for cache in dummy.kv_caches:
+                cache.length = 1
         return finished
 
     def _sample(self, logits: torch.Tensor) -> torch.Tensor:

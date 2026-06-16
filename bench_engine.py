@@ -108,7 +108,12 @@ def time_run(fn, device):
     steps = fn()
     if device == "cuda":
         torch.cuda.synchronize()
-    return time.perf_counter() - t0, steps
+    elapsed = time.perf_counter() - t0
+    if device == "cuda":
+        # fn built its own engine (and KV pools) internally; it is unreferenced now, so
+        # reclaim its VRAM before the next phase allocates — matters on small GPUs.
+        torch.cuda.empty_cache()
+    return elapsed, steps
 
 
 def main():
@@ -127,10 +132,8 @@ def main():
     parser.add_argument("--paged", action="store_true", help="Use a paged KV cache")
     parser.add_argument("--block-size", type=int, default=16, help="Paged KV block size")
     parser.add_argument("--num-blocks", type=int, default=2048, help="Paged KV blocks per layer")
-    parser.add_argument("--pad-decode", action="store_true",
-                        help="Pad decode-only batches to a fixed bucket size (paged; graph/compile foundation)")
-    parser.add_argument("--static-decode", action="store_true",
-                        help="Route decode-only steps through the loop-free forward_decode (paged)")
+    parser.add_argument("--cuda-graph", action="store_true",
+                        help="Replay a captured CUDA graph per bucket for decode steps (paged)")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -141,7 +144,7 @@ def main():
     requests = make_requests(args.requests, model_cfg["vocab_size"], seed=args.seed)
     tokens = total_tokens(requests)
     engine_kwargs = dict(paged=args.paged, block_size=args.block_size, num_blocks=args.num_blocks,
-                         pad_decode=args.pad_decode, static_decode=args.static_decode)
+                         cuda_graph=args.cuda_graph)
 
     print(f"device={args.device} dtype={args.dtype} d_model={model_cfg['d_model']} layers={model_cfg['num_layers']} "
           f"requests={args.requests} slots={args.batch} paged={args.paged} flash={use_flash_attn} tokens_to_generate={tokens}")

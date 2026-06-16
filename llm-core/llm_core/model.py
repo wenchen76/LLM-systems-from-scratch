@@ -831,9 +831,11 @@ class CausalMultiHeadSelfAttention(nn.Module):
                 out[:, start : start + 1] = scaled_dot_product_attention(q, cache.k, cache.v)
 
     def forward_decode(self, x, positions, pool, block_tables, phys, offset, seq_lens, q_positions):
-        """Fixed-batch single-token decode (graph/compile path). x: (B, d_model). Projects,
-        applies RoPE, scatters this token's K/V into the pool at (phys, offset), then reads
-        attention from the pool via block_tables — one paged_decode launch, no Python loop."""
+        """Fixed-batch single-token decode — the CUDA-graph-captured path. x: (B, d_model).
+        Projects, applies RoPE, scatters this token's K/V into the pool at (phys, offset), then
+        reads attention from the pool via block_tables in one paged_decode launch (no Python
+        loop, no host sync). CUDA only (paged_decode is a Triton kernel)."""
+        from llm_systems.kernels.triton_flash_attention import paged_decode
         B = x.shape[0]
         Q = self.q_proj(x)
         K = self.k_proj(x)
@@ -844,31 +846,10 @@ class CausalMultiHeadSelfAttention(nn.Module):
         K = self.positional_encoder(K, pos)
         pool.k[phys, :, offset, :] = K.permute(1, 0, 2).to(pool.k.dtype)  # write new token's KV
         pool.v[phys, :, offset, :] = V.permute(1, 0, 2).to(pool.v.dtype)
-
-        if self.use_flash_attn and x.is_cuda:
-            from llm_systems.kernels.triton_flash_attention import paged_decode
-            out = torch.empty_like(Q)
-            paged_decode(Q.contiguous(), pool.k, pool.v, out, q_positions, block_tables, seq_lens, pool.block_size)
-        else:
-            out = self._decode_eager(Q, pool, block_tables, seq_lens)  # CPU correctness fallback (loops)
+        out = torch.empty_like(Q)
+        paged_decode(Q.contiguous(), pool.k, pool.v, out, q_positions, block_tables, seq_lens, pool.block_size)
         out = rearrange(out, "h b d -> b (h d)").contiguous()
         return self.output_proj(out)
-
-    def _decode_eager(self, Q, pool, block_tables, seq_lens):
-        """Reference decode used off the CUDA flash path: gather each sequence's cached KV
-        from the pool via its block table and run SDPA. Loops over the batch (not graphed)."""
-        heads, B, d = Q.shape
-        bs = pool.block_size
-        out = torch.empty_like(Q)
-        for i in range(B):
-            length = int(seq_lens[i])
-            pos = torch.arange(length, device=Q.device)
-            blk = block_tables[i][pos // bs].long()
-            off = pos % bs
-            k = pool.k[blk, :, off, :].permute(1, 0, 2)  # (heads, length, d)
-            v = pool.v[blk, :, off, :].permute(1, 0, 2)
-            out[:, i : i + 1, :] = torch.nn.functional.scaled_dot_product_attention(Q[:, i : i + 1, :], k, v)
-        return out
 
 
 def silu(x: torch.Tensor):
