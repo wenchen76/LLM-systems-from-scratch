@@ -65,6 +65,22 @@ def test_paged_engine_greedy_matches_sequential():
     assert all(pool.num_free == pool.num_blocks for pool in engine.pools)  # no block leak
 
 
+def test_paged_static_decode_matches_sequential():
+    """The loop-free forward_decode path (static_decode=True) must produce the same tokens
+    as sequential generation — it validates the prebuilt decode metadata and forward_decode
+    (here through its eager fallback; the CUDA path is the same code with paged_decode)."""
+    model = make_model()
+    prompts = make_prompts([5, 12, 3, 8], SMALL_CONFIG["vocab_size"])
+    sp = SamplingParams(max_tokens=20, top_k=1)
+
+    engine = LLMEngine(model, device="cpu", paged=True, static_decode=True, block_size=4, num_blocks=512)
+    outputs = engine.generate(prompts, sp)
+
+    for prompt, out in zip(prompts, outputs):
+        assert out == greedy_reference(model, prompt, 20)
+    assert all(pool.num_free == pool.num_blocks for pool in engine.pools)  # no block leak
+
+
 def test_paged_pad_decode_matches_sequential():
     """Fixed-shape decode (pad_decode=True): padding a decode batch up to a bucket
     size with throwaway dummy requests must not change any real request's output —

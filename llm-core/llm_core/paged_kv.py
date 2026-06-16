@@ -34,6 +34,7 @@ class BlockPool:
         self.v = torch.zeros_like(self.k)
         self._free: list[int] = list(reversed(range(num_blocks)))  # pop() hands out 0, 1, 2, ...
         self._decode_scratch: dict[str, torch.Tensor] = {}  # reused per-step decode-metadata buffers
+        self.max_seq_blocks: int | None = None  # fixed block-table width for graph capture (engine sets it)
 
     def decode_buffer(self, name: str, rows: int, cols: int | None = None,
                       dtype: torch.dtype = torch.int64) -> torch.Tensor:

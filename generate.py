@@ -58,6 +58,8 @@ def main():
     parser.add_argument("--paged", action="store_true", help="Use a paged KV cache")
     parser.add_argument("--block-size", type=int, default=16, help="Paged KV block size")
     parser.add_argument("--num-blocks", type=int, default=2048, help="Paged KV blocks per layer")
+    parser.add_argument("--static-decode", action="store_true",
+                        help="Route decode-only steps through the loop-free forward_decode (paged)")
     args = parser.parse_args()
 
     if args.device == "auto":
@@ -82,7 +84,8 @@ def main():
     eos_token_id = tokenizer.encode("<|endoftext|>")[0] if "<|endoftext|>" in tokenizer.special_tokens else None
 
     engine = LLMEngine(model, device=device, paged=args.paged,
-                       block_size=args.block_size, num_blocks=args.num_blocks)
+                       block_size=args.block_size, num_blocks=args.num_blocks,
+                       static_decode=args.static_decode)
     sampling = SamplingParams(
         max_tokens=args.max_tokens,
         temperature=args.temperature,
