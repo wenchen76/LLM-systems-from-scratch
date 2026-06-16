@@ -33,6 +33,26 @@ class BlockPool:
         self.k = torch.zeros(num_blocks, num_heads, block_size, d_head, dtype=dtype, device=device)
         self.v = torch.zeros_like(self.k)
         self._free: list[int] = list(reversed(range(num_blocks)))  # pop() hands out 0, 1, 2, ...
+        self._decode_scratch: dict[str, torch.Tensor] = {}  # reused per-step decode-metadata buffers
+
+    def decode_buffer(self, name: str, rows: int, cols: int | None = None,
+                      dtype: torch.dtype = torch.int64) -> torch.Tensor:
+        """A reusable buffer for one decode step's metadata (block ids, offsets,
+        lengths, ...), grown on demand and sliced to the requested shape. Reusing one
+        buffer instead of allocating a fresh tensor each step keeps the address stable
+        between same-shape steps — the prerequisite for CUDA-graph capture / compile of
+        the decode path. Callers overwrite the whole slice (copy_) before reading it."""
+        buf = self._decode_scratch.get(name)
+        fits = buf is not None and buf.shape[0] >= rows and (cols is None or (buf.dim() == 2 and buf.shape[1] >= cols))
+        if not fits:
+            cap_rows = rows if buf is None else max(rows, buf.shape[0])
+            if cols is None:
+                buf = torch.empty(cap_rows, dtype=dtype, device=self.k.device)
+            else:
+                cap_cols = cols if (buf is None or buf.dim() < 2) else max(cols, buf.shape[1])
+                buf = torch.empty(cap_rows, cap_cols, dtype=dtype, device=self.k.device)
+            self._decode_scratch[name] = buf
+        return buf[:rows] if cols is None else buf[:rows, :cols]
 
     @property
     def num_free(self) -> int:
@@ -133,9 +153,11 @@ def append_decode(caches: list[PagedKVCache], k_new: torch.Tensor, v_new: torch.
     for cache in caches:  # grow a table by one block only when the new token spills over (rare)
         if cache.length // bs >= len(cache.block_table):
             cache.block_table.append(pool.allocate())
-    device = pool.k.device
-    phys = torch.tensor([c.block_table[c.length // bs] for c in caches], device=device)
-    offset = torch.tensor([c.length % bs for c in caches], device=device)
+    n = len(caches)
+    phys = pool.decode_buffer("phys", n)  # reused buffers -> stable address, no per-step alloc
+    offset = pool.decode_buffer("offset", n)
+    phys.copy_(torch.tensor([c.block_table[c.length // bs] for c in caches]))
+    offset.copy_(torch.tensor([c.length % bs for c in caches]))
     pool.k[phys, :, offset, :] = k_new.permute(1, 0, 2).to(pool.k.dtype)  # (R, heads, d_head)
     pool.v[phys, :, offset, :] = v_new.permute(1, 0, 2).to(pool.v.dtype)
     for cache in caches:

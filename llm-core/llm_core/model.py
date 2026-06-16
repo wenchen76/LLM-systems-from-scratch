@@ -768,19 +768,27 @@ class CausalMultiHeadSelfAttention(nn.Module):
                 flash_decode = paged_decode = None
             if flash_decode is not None:
                 device = Q.device
-                q_positions = torch.tensor([s for s, _ in seqs], device=device, dtype=torch.int32)
-                seq_lens = torch.tensor([cache.length for _, cache in seqs], device=device, dtype=torch.int32)
+                n = len(seqs)
                 if seqs[0][1].is_paged:
                     # Paged: read KV straight from the pool via per-sequence block tables.
+                    # Metadata fills reused pool buffers (stable address, no per-step alloc)
+                    # rather than allocating fresh tensors each layer.
                     pool = seqs[0][1].pool
                     tables = [cache.block_table for _, cache in seqs]
                     max_blocks = max(len(t) for t in tables)
                     padded = [t + [0] * (max_blocks - len(t)) for t in tables]
-                    block_tables = torch.tensor(padded, device=device, dtype=torch.int32)  # one transfer, not R
+                    block_tables = pool.decode_buffer("block_tables", n, max_blocks, dtype=torch.int32)
+                    block_tables.copy_(torch.tensor(padded, dtype=torch.int32))
+                    q_positions = pool.decode_buffer("q_positions", n, dtype=torch.int32)
+                    q_positions.copy_(torch.tensor([s for s, _ in seqs], dtype=torch.int32))
+                    seq_lens = pool.decode_buffer("seq_lens", n, dtype=torch.int32)
+                    seq_lens.copy_(torch.tensor([cache.length for _, cache in seqs], dtype=torch.int32))
                     paged_decode(Q.contiguous(), pool.k, pool.v, out,
                                  q_positions, block_tables, seq_lens, pool.block_size)
                 else:
                     # Contiguous: concatenate the caches along the key axis.
+                    q_positions = torch.tensor([s for s, _ in seqs], device=device, dtype=torch.int32)
+                    seq_lens = torch.tensor([cache.length for _, cache in seqs], device=device, dtype=torch.int32)
                     k_flat = torch.cat([cache.k for _, cache in seqs], dim=1).contiguous()
                     v_flat = torch.cat([cache.v for _, cache in seqs], dim=1).contiguous()
                     starts = torch.cumsum(
