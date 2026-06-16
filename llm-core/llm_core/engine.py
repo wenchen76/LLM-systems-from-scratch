@@ -63,7 +63,8 @@ class LLMEngine:
     """Iteration-level scheduler for continuous batching."""
 
     def __init__(self, model: TransformerLM, device: str = "cpu", max_running: int = 64,
-                 paged: bool = False, block_size: int = 16, num_blocks: int = 4096):
+                 paged: bool = False, block_size: int = 16, num_blocks: int = 4096,
+                 pad_decode: bool = False):
         self.model = model.eval()
         self.device = device
         self.context_length = model.context_length
@@ -71,6 +72,13 @@ class LLMEngine:
         self.waiting: deque[Request] = deque()
         self.running: list[Request] = []
         self._next_id = 0
+
+        # Optional fixed-shape decode: pad a decode-only batch up to a bucket size
+        # with throwaway dummy requests so the forward runs on one of a few constant
+        # shapes — the prerequisite for CUDA-graph capture / compile. Paged only.
+        self.pad_decode = pad_decode and paged
+        self._dummies: list[Request] = []
+        self._buckets = sorted({b for b in (1, 2, 4, 8, 16, 32, 64, 128, 256) if b < max_running} | {max_running})
 
         # Optional paged KV: one block pool per layer, shared by all requests.
         self.paged = paged
@@ -94,6 +102,30 @@ class LLMEngine:
             return [PagedKVCache(pool) for pool in self.pools]
         return self.model.new_kv_cache()
 
+    def _bucket(self, r: int) -> int:
+        """Smallest fixed bucket size >= r, so the decode forward runs on one of a few
+        constant shapes a captured graph can be keyed on."""
+        for b in self._buckets:
+            if b >= r:
+                return b
+        return self._buckets[-1]
+
+    def _take_dummies(self, n: int) -> list[Request]:
+        """n throwaway requests to pad a decode batch up to a bucket. Each has paged
+        caches seeded with one token; its output is discarded and its caches are reset
+        each step, so it never grows or touches a real request's KV."""
+        cfg = self.model.config
+        d_head = cfg["d_model"] // cfg["num_heads"]
+        dtype = next(self.model.parameters()).dtype
+        while len(self._dummies) < n:
+            caches = self._new_caches()
+            z = torch.zeros(cfg["num_heads"], 1, d_head, device=self.device, dtype=dtype)
+            for cache in caches:
+                cache.append(z, z)  # seed length 1 (one block)
+            self._dummies.append(Request(-1, [], SamplingParams(), output_ids=[0],
+                                         kv_caches=caches, prefilled=True, state=RequestState.RUNNING))
+        return self._dummies[:n]
+
     # ---- public API ---------------------------------------------------------
     def add_request(self, prompt_ids, sampling: SamplingParams | None = None) -> int:
         """Enqueue a request. It is admitted on a later step() when a slot is free."""
@@ -113,12 +145,20 @@ class LLMEngine:
         if not self.running:
             return []
 
-        flat, cu_seqlens, position_ids, caches, last_idx = self._build_batch()
+        # Fixed-shape decode: on a decode-only step pad up to a bucket with dummy
+        # requests, so the forward runs on a constant shape. Dummies sit after the
+        # real requests, so the real tokens keep flat indices 0..len(real)-1.
+        real = self.running
+        dummies: list[Request] = []
+        if self.pad_decode and all(r.prefilled for r in real):
+            dummies = self._take_dummies(self._bucket(len(real)) - len(real))
+
+        flat, cu_seqlens, position_ids, caches, last_idx = self._build_batch(real + dummies)
         logits = self.model.forward_varlen(flat, cu_seqlens, position_ids, request_kv_caches=caches)
-        next_ids = self._sample(logits[last_idx])  # one token per running request
+        next_ids = self._sample(logits[last_idx[:len(real)]])  # only the real requests
 
         finished = []
-        for req, token in zip(self.running, next_ids.tolist()):
+        for req, token in zip(real, next_ids.tolist()):
             req.prefilled = True
             req.output_ids.append(token)
             req.finish_reason = self._finish_reason(req, token)
@@ -126,12 +166,15 @@ class LLMEngine:
                 req.state = RequestState.FINISHED
                 finished.append(req)
 
-        self.running = [r for r in self.running if r.state is RequestState.RUNNING]
+        self.running = [r for r in real if r.state is RequestState.RUNNING]
         if self.paged:  # return finished requests' blocks and reservations to the pool
             for req in finished:
                 for cache in req.kv_caches:
                     cache.free()
                 self.reserved_blocks -= req.reserved_blocks
+        for dummy in dummies:  # reset so dummies never grow or leak blocks
+            for cache in dummy.kv_caches:
+                cache.length = 1
         return finished
 
     def generate(self, prompts, sampling: SamplingParams | None = None) -> list[list[int]]:
@@ -172,17 +215,19 @@ class LLMEngine:
         req.reserved_blocks = need
         return True
 
-    def _build_batch(self):
-        """Flatten each running request's new tokens into one varlen batch.
+    def _build_batch(self, requests: list[Request] | None = None):
+        """Flatten each request's new tokens into one varlen batch (defaults to the
+        running set; a padded decode step passes running + dummies).
 
         A not-yet-prefilled request contributes its whole prompt; a decoding one
         contributes just its last token. Each token gets its absolute position.
         """
+        requests = self.running if requests is None else requests
         flat: list[int] = []
         positions: list[int] = []
         cu: list[int] = [0]
         last_idx: list[int] = []
-        for req in self.running:
+        for req in requests:
             if not req.prefilled:
                 tokens, start = req.prompt_ids, 0
             else:
@@ -196,7 +241,7 @@ class LLMEngine:
             to_t(flat),
             to_t(cu),
             to_t(positions),
-            [req.kv_caches for req in self.running],
+            [req.kv_caches for req in requests],
             to_t(last_idx),
         )
 

@@ -127,6 +127,8 @@ def main():
     parser.add_argument("--paged", action="store_true", help="Use a paged KV cache")
     parser.add_argument("--block-size", type=int, default=16, help="Paged KV block size")
     parser.add_argument("--num-blocks", type=int, default=2048, help="Paged KV blocks per layer")
+    parser.add_argument("--pad-decode", action="store_true",
+                        help="Pad decode-only batches to a fixed bucket size (paged; graph/compile foundation)")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -136,7 +138,8 @@ def main():
     model = TransformerLM(**model_cfg, use_flash_attn=use_flash_attn).to(device=args.device, dtype=dtype).eval()
     requests = make_requests(args.requests, model_cfg["vocab_size"], seed=args.seed)
     tokens = total_tokens(requests)
-    engine_kwargs = dict(paged=args.paged, block_size=args.block_size, num_blocks=args.num_blocks)
+    engine_kwargs = dict(paged=args.paged, block_size=args.block_size, num_blocks=args.num_blocks,
+                         pad_decode=args.pad_decode)
 
     print(f"device={args.device} dtype={args.dtype} d_model={model_cfg['d_model']} layers={model_cfg['num_layers']} "
           f"requests={args.requests} slots={args.batch} paged={args.paged} flash={use_flash_attn} tokens_to_generate={tokens}")

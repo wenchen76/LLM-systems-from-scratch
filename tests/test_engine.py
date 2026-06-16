@@ -65,6 +65,23 @@ def test_paged_engine_greedy_matches_sequential():
     assert all(pool.num_free == pool.num_blocks for pool in engine.pools)  # no block leak
 
 
+def test_paged_pad_decode_matches_sequential():
+    """Fixed-shape decode (pad_decode=True): padding a decode batch up to a bucket
+    size with throwaway dummy requests must not change any real request's output —
+    greedy stays byte-for-byte equal to sequential generation — and the dummies must
+    actually be exercised."""
+    model = make_model()
+    prompts = make_prompts([5, 9, 4, 7, 6], SMALL_CONFIG["vocab_size"])  # 5 running -> pad to bucket 8
+    sp = SamplingParams(max_tokens=18, top_k=1)
+
+    engine = LLMEngine(model, device="cpu", paged=True, pad_decode=True, block_size=4, num_blocks=512)
+    outputs = engine.generate(prompts, sp)
+
+    for prompt, out in zip(prompts, outputs):
+        assert out == greedy_reference(model, prompt, 18)
+    assert engine._dummies, "padding never triggered — test would be vacuous"
+
+
 def test_paged_admission_control_queues_when_blocks_scarce():
     """With too few blocks to run everything at once, requests queue (no
     BlockPool exhaustion) and still finish correctly; blocks/reservations clear."""
