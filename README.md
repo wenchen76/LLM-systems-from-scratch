@@ -409,6 +409,58 @@ is not an apples-to-apples serving-engine baseline, but it shows that this
 allocator pressure is representative of dynamic contiguous KV caches rather than
 an artifact of this repo's baseline.
 
+### CUDA-graph decode (`--cuda-graph`)
+
+A decode step launches dozens of small kernels with Python scheduling in
+between. At small batch sizes the GPU often waits on the host, so the step is
+*launch-bound* rather than compute-bound. With `--cuda-graph` (paged KV, CUDA
+only), the engine captures the decode-only `model.forward_decode` path once per
+bucketed batch size and replays it with a single graph launch, removing most of
+the per-step launch and Python overhead.
+
+CUDA graph replay requires stable tensor shapes and memory addresses. To keep
+those fixed, the engine pads each decode batch to its bucket with disposable
+dummy requests, uses fixed-width block tables, and fills long-lived input
+buffers in place before replay ([decode_graphs.py](llm-core/llm_core/decode_graphs.py)).
+
+| Flag | What it does |
+|---|---|
+| `--cuda-graph` | Replay a captured CUDA graph per bucket for pure-decode steps (paged, CUDA only) |
+
+#### Benchmark
+
+Environment: A100 80GB, GPT-3 XL
+([configures/gpt3xl.yaml](configures/gpt3xl.yaml)), BF16, paged KV cache. Each
+row compares two [bench_engine.py](bench_engine.py) **continuous-batching** runs
+on the same request trace: the normal decode path and the same run with
+`--cuda-graph`. Prompt lengths are 4–32 tokens, and output lengths are drawn
+uniformly from the listed range. The batch-8 rows use 32 total requests; the
+batch-32 rows use 128 total requests. `speedup` is CUDA-graph throughput divided
+by the matching no-graph throughput.
+
+| batch | output tokens | no-graph tok/s | cuda-graph tok/s | speedup |
+|---:|---:|---:|---:|---:|
+| 8 | 8–96 | 153.4 | 416.6 | 2.72x |
+| 8 | 1024–1536 | 173.5 | 593.4 | 3.42x |
+| 32 | 8–96 | 550.6 | 918.7 | 1.67x |
+| 32 | 1024–1536 | 669.0 | 1545.6 | 2.31x |
+
+Two trends explain the spread:
+
+- **Smaller batches benefit most** (2.72x at batch 8 vs 1.67x at batch 32, short
+  outputs). CUDA graph replay removes a roughly fixed per-step launch and
+  scheduling cost. At batch 8, each step reads relatively little KV, so that
+  fixed host-side cost dominates and throughput nearly triples. At batch 32, the
+  GPU does more real work per step, so the same fixed cost is a smaller fraction
+  of latency.
+- **Longer outputs have cleaner decode stretches** (3.42x vs 2.72x at batch 8).
+  Long outputs churn less: most scheduler iterations are pure decode, and those
+  can replay the graph. Short outputs frequently finish and admit replacements;
+  each newly admitted request needs a `forward_varlen` prefill, so that mixed
+  step falls back to the normal path. Separating prefill from decode (see
+  Roadmap) would let the decode portion replay the graph even when new requests
+  enter the batch.
+
 ## Fused attention kernels ([triton_flash_attention.py](llm-systems/llm_systems/kernels/triton_flash_attention.py))
 
 The continuous-batching engine's CUDA attention runs through two hand-written
