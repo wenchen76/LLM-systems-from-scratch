@@ -79,24 +79,25 @@ class DecodeGraphs:
 
     # ---- per-step fill (host side, before replay) ----------------------------
     def _fill(self, batch, s: dict):
-        dev = self.e.device
         bs = self.e.block_size
+        max_blocks = s["block_tables"][0].shape[1]
         lengths = [r.kv_caches[0].length for r in batch]  # same across layers
-        s["input_ids"].copy_(torch.tensor([r.output_ids[-1] for r in batch], device=dev))
-        s["positions"].copy_(torch.tensor(lengths, device=dev))
-        s["seq_lens"].copy_(torch.tensor([L + 1 for L in lengths], dtype=torch.int32, device=dev))
+        s["input_ids"].copy_(torch.tensor([r.output_ids[-1] for r in batch]))
+        s["positions"].copy_(torch.tensor(lengths))
+        s["seq_lens"].copy_(torch.tensor([L + 1 for L in lengths], dtype=torch.int32))
         for layer, pool in enumerate(self.e.pools):
-            bt = s["block_tables"][layer]
-            bt.zero_()
-            phys_vals, offset_vals = [], []
-            for i, req in enumerate(batch):
+            rows, phys_vals, offset_vals = [], [], []
+            for req in batch:
                 cache = req.kv_caches[layer]
                 L = cache.length
                 if L // bs >= len(cache.block_table):  # grow on the host before replay
                     cache.block_table.append(pool.allocate())
                 table = cache.block_table
-                bt[i, : len(table)].copy_(torch.tensor(table, dtype=torch.int32, device=dev))
+                rows.append(table + [0] * (max_blocks - len(table)))  # pad to the fixed width
                 phys_vals.append(table[L // bs])
                 offset_vals.append(L % bs)
-            s["phys"][layer].copy_(torch.tensor(phys_vals, device=dev))
-            s["offset"][layer].copy_(torch.tensor(offset_vals, device=dev))
+            # one host->device copy per layer (not one per request) -- the metadata fill, not the
+            # graph replay, was the cost that made large batches slow.
+            s["block_tables"][layer].copy_(torch.tensor(rows, dtype=torch.int32))
+            s["phys"][layer].copy_(torch.tensor(phys_vals))
+            s["offset"][layer].copy_(torch.tensor(offset_vals))
