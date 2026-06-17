@@ -43,15 +43,16 @@ def load_model_config(path):
         return yaml.safe_load(f)["model"]
 
 
-def make_requests(n, vocab_size, seed=0):
-    """Varied prompt lengths and output lengths — the regime where static batching wastes the most."""
+def make_requests(n, vocab_size, min_tokens=8, max_tokens=96, seed=0):
+    """Varied prompt and output lengths. Output length is drawn from [min_tokens, max_tokens];
+    raise both for long cache lengths (more pure-decode steps, where CUDA-graph replay helps)."""
     gen = torch.Generator().manual_seed(seed)
     reqs = []
     for _ in range(n):
         prompt_len = int(torch.randint(4, 32, (1,), generator=gen))
-        max_tokens = int(torch.randint(8, 96, (1,), generator=gen))  # wide spread
+        out_len = int(torch.randint(min_tokens, max_tokens + 1, (1,), generator=gen))
         prompt = torch.randint(0, vocab_size, (prompt_len,), generator=gen).tolist()
-        reqs.append((prompt, SamplingParams(max_tokens=max_tokens, top_k=50)))
+        reqs.append((prompt, SamplingParams(max_tokens=out_len, top_k=50)))
     return reqs
 
 
@@ -120,6 +121,9 @@ def main():
     parser = argparse.ArgumentParser(description="Continuous vs static batching stress test")
     parser.add_argument("--requests", type=int, default=48)
     parser.add_argument("--batch", type=int, default=8, help="Max concurrent requests (slots)")
+    parser.add_argument("--min-tokens", type=int, default=8, help="Lower bound on generated tokens per request")
+    parser.add_argument("--max-tokens", type=int, default=96,
+                        help="Upper bound on generated tokens per request (raise both for long cache lengths)")
     parser.add_argument("--device", type=str, default="cpu", help="cpu, cuda, mps")
     parser.add_argument("--config", type=str, default=None,
                         help="Training YAML for model dims (e.g. configures/gpt3xl.yaml); default: small built-in")
@@ -141,7 +145,8 @@ def main():
     dtype = getattr(torch, args.dtype)
     use_flash_attn = not args.no_flash_attn
     model = TransformerLM(**model_cfg, use_flash_attn=use_flash_attn).to(device=args.device, dtype=dtype).eval()
-    requests = make_requests(args.requests, model_cfg["vocab_size"], seed=args.seed)
+    requests = make_requests(args.requests, model_cfg["vocab_size"],
+                             min_tokens=args.min_tokens, max_tokens=args.max_tokens, seed=args.seed)
     tokens = total_tokens(requests)
     engine_kwargs = dict(paged=args.paged, block_size=args.block_size, num_blocks=args.num_blocks,
                          cuda_graph=args.cuda_graph)
